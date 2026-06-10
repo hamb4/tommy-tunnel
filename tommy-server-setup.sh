@@ -21,7 +21,8 @@
 #    5) WireGuard              (Kernel-level VPN, fastest raw throughput)
 #    6) Brook                  (Ultra-lightweight, simple)
 #    7) SSH Tunnel             (No extra software, always available)
-#    8) Port Forwarding        (Forward specific ports through tunnel)
+#    8) Recommended Combo      (VLESS + Hysteria2 + SS)
+#    9) Port Forwarding        (External Proxy - Authenticated Tunnel)
 #
 #  USAGE:
 #    chmod +x tommy-server-setup.sh
@@ -113,7 +114,7 @@ show_menu() {
     echo -e "${CYAN}║  6)  Brook                  (Ultra-lightweight, zero-config)    ║${NC}"
     echo -e "${CYAN}║  7)  SSH Tunnel             (No extra software needed)          ║${NC}"
     echo -e "${CYAN}║  8)  Recommended Combo      (VLESS + Hysteria2 + SS)           ║${NC}"
-    echo -e "${CYAN}║  9)  Port Forwarding        (Forward ports through tunnel)      ║${NC}"
+    echo -e "${CYAN}║  9)  Port Forwarding        (External Proxy Auth. Tunnel)      ║${NC}"
     echo -e "${CYAN}║  0)  Exit                                                        ║${NC}"
     echo -e "${CYAN}║                                                                  ║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
@@ -197,6 +198,128 @@ EOF
     else
         info "UDP buffers already optimized."
     fi
+
+    # Run security hardening
+    harden_security
+}
+
+# ── Security Hardening ────────────────────────────────────────────────────────
+harden_security() {
+    info "Applying security hardening..."
+
+    # 1. UFW: deny incoming by default, allow SSH
+    if command -v ufw &>/dev/null; then
+        if ! ufw status 2>/dev/null | grep -q "active"; then
+            info "Enabling UFW with deny-incoming default..."
+            ufw --force enable 2>/dev/null || true
+            ufw default deny incoming 2>/dev/null || true
+            ufw default allow outgoing 2>/dev/null || true
+            # Allow SSH before enabling to prevent lockout
+            ufw allow ssh 2>/dev/null || true
+            ufw allow 22/tcp 2>/dev/null || true
+        fi
+    fi
+
+    # 2. SSH hardening
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        info "Hardening SSH configuration..."
+
+        # Disable password authentication for root
+        if grep -q "^#*PasswordAuthentication" /etc/ssh/sshd_config 2>/dev/null; then
+            sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config 2>/dev/null || true
+        elif ! grep -q "PasswordAuthentication" /etc/ssh/sshd_config 2>/dev/null; then
+            echo "PasswordAuthentication no" >> /etc/ssh/sshd_config
+        fi
+
+        # Disable root login with password (key-only)
+        if grep -q "^#*PermitRootLogin" /etc/ssh/sshd_config 2>/dev/null; then
+            sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config 2>/dev/null || true
+        elif ! grep -q "PermitRootLogin" /etc/ssh/sshd_config 2>/dev/null; then
+            echo "PermitRootLogin prohibit-password" >> /etc/ssh/sshd_config
+        fi
+
+        # Set MaxAuthTries to 3
+        if grep -q "^#*MaxAuthTries" /etc/ssh/sshd_config 2>/dev/null; then
+            sed -i 's/^#*MaxAuthTries.*/MaxAuthTries 3/' /etc/ssh/sshd_config 2>/dev/null || true
+        elif ! grep -q "MaxAuthTries" /etc/ssh/sshd_config 2>/dev/null; then
+            echo "MaxAuthTries 3" >> /etc/ssh/sshd_config
+        fi
+
+        # Disable empty passwords
+        if grep -q "^#*PermitEmptyPasswords" /etc/ssh/sshd_config 2>/dev/null; then
+            sed -i 's/^#*PermitEmptyPasswords.*/PermitEmptyPasswords no/' /etc/ssh/sshd_config 2>/dev/null || true
+        elif ! grep -q "PermitEmptyPasswords" /etc/ssh/sshd_config 2>/dev/null; then
+            echo "PermitEmptyPasswords no" >> /etc/ssh/sshd_config
+        fi
+
+        # Restart SSH to apply changes
+        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+    fi
+
+    # 3. Kernel hardening via sysctl
+    info "Applying kernel security parameters..."
+    local SYSCTL_SECURITY=/etc/sysctl.d/99-tommy-security.conf
+    cat > "$SYSCTL_SECURITY" <<'EOF'
+# Tommy v3.0 - Security Hardening
+kernel.randomize_va_space=2
+kernel.exec-shield=1
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
+net.ipv4.conf.all.accept_source_route=0
+net.ipv4.conf.default.accept_source_route=0
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+fs.suid_dumpable=0
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv6.conf.all.accept_redirects=0
+EOF
+    sysctl -p "$SYSCTL_SECURITY" 2>/dev/null || true
+
+    # 4. Disable unnecessary services
+    for svc in avahi-daemon cups rpcbind; do
+        if systemctl is-enabled "${svc}" 2>/dev/null | grep -q "enabled"; then
+            info "Disabling unnecessary service: ${svc}"
+            systemctl stop "${svc}" 2>/dev/null || true
+            systemctl disable "${svc}" 2>/dev/null || true
+        fi
+    done
+
+    # 5. Set strict permissions on /etc/tommy/
+    if [[ -d /etc/tommy ]]; then
+        chmod 700 /etc/tommy
+        chown root:root /etc/tommy
+    fi
+    mkdir -p /etc/tommy
+    chmod 700 /etc/tommy
+    chown root:root /etc/tommy
+
+    # 6. Enable process accounting if available
+    if command -v accton &>/dev/null; then
+        accton /var/log/accounting 2>/dev/null || true
+        systemctl enable psacct 2>/dev/null || systemctl enable acct 2>/dev/null || true
+    fi
+
+    # 7. Enable automatic security updates (Debian/Ubuntu)
+    if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
+        if ! command -v unattended-upgrade &>/dev/null; then
+            apt-get install -y unattended-upgrades 2>/dev/null || true
+        fi
+        if command -v unattended-upgrade &>/dev/null; then
+            dpkg-reconfigure -plow unattended-upgrades 2>/dev/null || true
+        fi
+    fi
+
+    # 8. Warning if SSH still using password auth
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        if grep -q "^PasswordAuthentication yes" /etc/ssh/sshd_config 2>/dev/null; then
+            warn "SSH still allows password authentication!"
+            warn "Consider setting up SSH keys and disabling password auth for better security."
+        fi
+    fi
+
+    info "Security hardening applied."
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -359,7 +482,7 @@ setup_hysteria() {
         return
     fi
 
-    info "Hysteria2 installed: $(hierarchy version 2>/dev/null || hysteria version 2>/dev/null | head -1)"
+    info "Hysteria2 installed: $(hysteria version 2>/dev/null | head -1)"
 
     HY_PASSWORD=$(generate_password)
     read -rp "Enter Hysteria2 port [8443]: " HY_PORT
@@ -1173,516 +1296,402 @@ CEOF
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  8. PORT FORWARDING
+#  9. PORT FORWARDING (External Proxy - Authenticated Tunnel)
 # ══════════════════════════════════════════════════════════════════════════════
 setup_port_forwarding() {
     info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    info "  Port Forwarding Setup"
+    info "  External Proxy Tunnel Setup"
     info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     echo ""
-    echo -e "${CYAN}  Port Forwarding Methods:${NC}"
-    echo -e "${CYAN}  1) SSH Port Forwarding       (-L local / -R remote via autossh)${NC}"
-    echo -e "${CYAN}  2) Xray dokodemo-door         (through VLESS+Reality tunnel)${NC}"
-    echo -e "${CYAN}  3) iptables NAT Forwarding    (through WireGuard tunnel)${NC}"
-    echo -e "${CYAN}  4) socat TCP/UDP Relay        (simple relay, no tunnel needed)${NC}"
-    echo -e "${CYAN}  0) Back to main menu${NC}"
+    info "This creates an authenticated dedicated tunnel between"
+    info "this foreign server and an Iranian server."
+    info "Like x-ui's 'external proxy' feature."
     echo ""
-    read -rp "Select port forwarding method [1-4]: " PF_METHOD
 
-    case "$PF_METHOD" in
-        1) pf_ssh ;;
-        2) pf_xray_dokodemo ;;
-        3) pf_iptables_nat ;;
-        4) pf_socat ;;
-        0) return ;;
-        *) warn "Invalid choice: $PF_METHOD"; return ;;
+    # Step 1: Choose tunnel port
+    read -rp "Enter tunnel port [443]: " TUNNEL_PORT
+    TUNNEL_PORT="${TUNNEL_PORT:-443}"
+
+    # Step 2: Iranian server IP
+    read -rp "Enter Iranian server IP address: " IRAN_IP
+    if [[ -z "$IRAN_IP" ]]; then
+        error "Iranian server IP is required"
+    fi
+
+    # Step 3: Speed selection
+    echo ""
+    echo -e "${CYAN}  Speed Level:${NC}"
+    echo -e "  ${YELLOW}1)${NC} Low       - 50 mbps (limited bandwidth)"
+    echo -e "  ${YELLOW}2)${NC} Medium    - 200 mbps (balanced)"
+    echo -e "  ${YELLOW}3)${NC} High      - 500 mbps (fast)"
+    echo -e "  ${YELLOW}4)${NC} Maximum   - 1000 mbps (unlimited)"
+    read -rp "Select speed [1-4, default=3]: " SPEED_LEVEL
+    SPEED_LEVEL="${SPEED_LEVEL:-3}"
+
+    # Map speed level to buffer sizes
+    case "$SPEED_LEVEL" in
+        1) STREAM_RECV=2097152;  CONN_RECV=4194304;  BW_LIMIT="50 mbps" ;;
+        2) STREAM_RECV=4194304;  CONN_RECV=8388608;  BW_LIMIT="200 mbps" ;;
+        3) STREAM_RECV=8388608;  CONN_RECV=16777216; BW_LIMIT="500 mbps" ;;
+        4) STREAM_RECV=16777216; CONN_RECV=33554432; BW_LIMIT="1000 mbps" ;;
+        *) STREAM_RECV=8388608;  CONN_RECV=16777216; BW_LIMIT="500 mbps"; SPEED_LEVEL=3 ;;
     esac
-}
 
-# ── 8a. SSH Port Forwarding (-L local / -R remote) ────────────────────────────
-pf_ssh() {
-    info "Setting up SSH Port Forwarding (autossh)..."
-
-    # Ensure autossh and sshpass are installed
-    if ! command -v autossh &>/dev/null; then
-        info "Installing autossh and sshpass..."
-        if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
-            apt-get install -y autossh sshpass 2>/dev/null || true
-        elif [[ "$OS_ID" == "centos" || "$OS_ID" == "rhel" || "$OS_ID" == "rocky" || "$OS_ID" == "almalinux" ]]; then
-            yum install -y autossh sshpass 2>/dev/null || true
-        fi
-    fi
-
-    # Ensure SSH tunnel user exists
-    if ! id "tommy-tunnel" &>/dev/null; then
-        setup_ssh_tunnel
-    fi
-
-    SSH_PORT=$(grep -E "^Port " /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
-    SSH_PORT="${SSH_PORT:-22}"
-
+    # Step 4: Security level
     echo ""
-    echo -e "${YELLOW}  SSH Port Forwarding Types:${NC}"
-    echo -e "  ${CYAN}L)${NC} Local Forward  (-L)  Remote port -> Local port"
-    echo -e "  ${CYAN}R)${NC} Remote Forward (-R)  Local port -> Remote port"
-    echo ""
-    read -rp "Forward type (L/R) [L]: " PF_SSH_TYPE
-    PF_SSH_TYPE="${PF_SSH_TYPE:-L}"
-    PF_SSH_TYPE=$(echo "$PF_SSH_TYPE" | tr '[:lower:]' '[:upper:]')
+    echo -e "${CYAN}  Security Level:${NC}"
+    echo -e "  ${YELLOW}1)${NC} Standard  - VMess + AES-128-GCM (good compatibility)"
+    echo -e "  ${YELLOW}2)${NC} Enhanced  - VLESS + TLS (better stealth)"
+    echo -e "  ${YELLOW}3)${NC} Maximum   - VLESS + Reality (best stealth, TLS 1.3 masquerade)"
+    read -rp "Select security level [1-3, default=3]: " SECURITY_LEVEL
+    SECURITY_LEVEL="${SECURITY_LEVEL:-3}"
 
-    read -rp "Bind address [0.0.0.0]: " PF_SSH_BIND
-    PF_SSH_BIND="${PF_SSH_BIND:-0.0.0.0}"
+    # Step 5: Generate private key (UUID)
+    TUNNEL_UUID=$(generate_uuid)
+    TUNNEL_PRIVATE_KEY="$TUNNEL_UUID"
 
-    read -rp "Local listen port (on this server): " PF_LOCAL_PORT
-    read -rp "Remote destination host [127.0.0.1]: " PF_REMOTE_HOST
-    PF_REMOTE_HOST="${PF_REMOTE_HOST:-127.0.0.1}"
-    read -rp "Remote destination port: " PF_REMOTE_PORT
+    info "Generated Private Key (UUID): ${TUNNEL_PRIVATE_KEY}"
 
-    if [[ -z "$PF_LOCAL_PORT" || -z "$PF_REMOTE_PORT" ]]; then
-        warn "Local and remote ports are required."
-        return
-    fi
-
-    # Generate SSH key if not exists
-    if [[ ! -f /root/.ssh/tommy_pf_key ]]; then
-        mkdir -p /root/.ssh
-        ssh-keygen -t ed25519 -f /root/.ssh/tommy_pf_key -N "" -q 2>/dev/null || true
-        # Copy key to tunnel user authorized_keys
-        mkdir -p /home/tommy-tunnel/.ssh
-        cat /root/.ssh/tommy_pf_key.pub >> /home/tommy-tunnel/.ssh/authorized_keys 2>/dev/null || true
-        chown -R tommy-tunnel:tommy-tunnel /home/tommy-tunnel/.ssh 2>/dev/null || true
-        chmod 700 /home/tommy-tunnel/.ssh 2>/dev/null || true
-        chmod 600 /home/tommy-tunnel/.ssh/authorized_keys 2>/dev/null || true
-    fi
-
-    local SVC_NAME="tommy-pf-ssh-${PF_LOCAL_PORT}"
-    local SSH_OPTS="-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ExitOnForwardFailure=yes"
-
-    if [[ "$PF_SSH_TYPE" == "L" ]]; then
-        # Local forward: this_server:local_port -> remote_host:remote_port via SSH
-        cat > /etc/systemd/system/${SVC_NAME}.service <<SVCEOF
-[Unit]
-Description=Tommy - SSH Local Port Forward (${PF_LOCAL_PORT} -> ${PF_REMOTE_HOST}:${PF_REMOTE_PORT})
-After=network.target tommy-ssh-tunnel.service
-Wants=network.target
-
-[Service]
-Type=simple
-Environment="AUTOSSH_GATETIME=0"
-ExecStart=/usr/bin/autossh -M 0 -N ${SSH_OPTS} -i /root/.ssh/tommy_pf_key -L ${PF_SSH_BIND}:${PF_LOCAL_PORT}:${PF_REMOTE_HOST}:${PF_REMOTE_PORT} -p ${SSH_PORT} tommy-tunnel@127.0.0.1
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-        info "SSH Local Forward: ${PF_SSH_BIND}:${PF_LOCAL_PORT} -> ${PF_REMOTE_HOST}:${PF_REMOTE_PORT}"
-
+    # Step 6: Install Xray if not present
+    if command -v xray &>/dev/null; then
+        info "Xray already installed: $(xray version | head -1)"
     else
-        # Remote forward: remote_host:remote_port -> this_server:local_port via SSH
-        cat > /etc/systemd/system/${SVC_NAME}.service <<SVCEOF
+        info "Installing Xray-core for tunnel bridge..."
+        bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install 2>/dev/null || true
+    fi
+
+    if ! command -v xray &>/dev/null; then
+        error "Xray installation failed. Cannot set up tunnel bridge."
+    fi
+
+    # Step 7: Configure based on security level
+    SECURITY_LABEL=""
+    case "$SECURITY_LEVEL" in
+        1)
+            SECURITY_LABEL="VMess+AES"
+            _pf_vmess_server
+            ;;
+        2)
+            SECURITY_LABEL="VLESS+TLS"
+            _pf_vless_tls_server
+            ;;
+        3)
+            SECURITY_LABEL="VLESS+Reality"
+            _pf_vless_reality_server
+            ;;
+        *)
+            SECURITY_LABEL="VLESS+Reality"
+            SECURITY_LEVEL=3
+            _pf_vless_reality_server
+            ;;
+    esac
+
+    # Step 8: Create systemd service
+    mkdir -p /etc/tommy/pf-tunnel
+    cat > /etc/systemd/system/tommy-pf-tunnel.service <<SVCEOF
 [Unit]
-Description=Tommy - SSH Remote Port Forward (${PF_REMOTE_HOST}:${PF_REMOTE_PORT} -> ${PF_LOCAL_PORT})
-After=network.target tommy-ssh-tunnel.service
+Description=Tommy - Authenticated Tunnel Bridge (Port ${TUNNEL_PORT})
+After=network.target
 Wants=network.target
 
 [Service]
 Type=simple
-Environment="AUTOSSH_GATETIME=0"
-ExecStart=/usr/bin/autossh -M 0 -N ${SSH_OPTS} -i /root/.ssh/tommy_pf_key -R ${PF_SSH_BIND}:${PF_REMOTE_PORT}:127.0.0.1:${PF_LOCAL_PORT} -p ${SSH_PORT} tommy-tunnel@127.0.0.1
+ExecStart=/usr/local/bin/xray run -c /etc/tommy/pf-tunnel/config.json
 Restart=on-failure
 RestartSec=5
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
-        info "SSH Remote Forward: ${PF_REMOTE_HOST}:${PF_REMOTE_PORT} -> 127.0.0.1:${PF_LOCAL_PORT}"
-    fi
 
+    # Step 9: Open firewall
+    open_firewall "$TUNNEL_PORT" tcp
+
+    # Step 10: Stop old service if present, then start new one
+    systemctl stop tommy-pf-tunnel 2>/dev/null || true
     systemctl daemon-reload
-    open_firewall "$PF_LOCAL_PORT" tcp
-    systemctl enable "${SVC_NAME}"
-    systemctl restart "${SVC_NAME}"
+    systemctl enable tommy-pf-tunnel
+    systemctl restart tommy-pf-tunnel
     sleep 2
 
-    if systemctl is-active --quiet "${SVC_NAME}"; then
-        info "SSH Port Forward service '${SVC_NAME}' is running!"
+    if systemctl is-active --quiet tommy-pf-tunnel; then
+        info "Tommy-PF-Tunnel running on port ${TUNNEL_PORT}!"
     else
-        warn "SSH Port Forward may have failed. Check: journalctl -u ${SVC_NAME} -n 20"
+        warn "Tommy-PF-Tunnel may have failed. Check: journalctl -u tommy-pf-tunnel -n 30"
     fi
 
-    # Save info
-    cat >> /root/port-forward-client-info.txt <<CEOF
+    # Step 11: Build additional info for display
+    local ADDITIONAL_INFO=""
+    if [[ "$SECURITY_LEVEL" == "3" ]]; then
+        ADDITIONAL_INFO="  Reality SNI:    ${CYAN}${PF_REALITY_DEST}${NC}
+  Public Key:     ${CYAN}${PF_PUBLIC_KEY}${NC}
+  Short ID:       ${CYAN}${PF_SHORT_ID}${NC}"
+    elif [[ "$SECURITY_LEVEL" == "2" ]]; then
+        ADDITIONAL_INFO="  TLS SNI:        ${CYAN}bing.com${NC}"
+    fi
 
+    # Save connection info
+    cat > /root/tommy-pf-tunnel-info.txt <<INFOEOF
 ================================================================
-  SSH Port Forward - ${SVC_NAME}
+  Tommy v3.0 - Authenticated Tunnel - Foreign Server Side
 ================================================================
-  Type:           SSH -${PF_SSH_TYPE} ${PF_SSH_TYPE}ocal Forward
-  Bind:           ${PF_SSH_BIND}
-  Local Port:     ${PF_LOCAL_PORT}
-  Remote Host:    ${PF_REMOTE_HOST}
-  Remote Port:    ${PF_REMOTE_PORT}
-  Service:        ${SVC_NAME}
-  Command:        autossh -M 0 -N -i /root/.ssh/tommy_pf_key -${PF_SSH_TYPE} ${PF_SSH_BIND}:${PF_LOCAL_PORT}:${PF_REMOTE_HOST}:${PF_REMOTE_PORT} -p ${SSH_PORT} tommy-tunnel@127.0.0.1
-================================================================
-CEOF
+  Tunnel Port:     ${TUNNEL_PORT}
+  Iranian IP:      ${IRAN_IP}
+  Private Key:     ${TUNNEL_PRIVATE_KEY}
+  Security Level:  ${SECURITY_LEVEL} (${SECURITY_LABEL})
+  Speed Level:     ${SPEED_LEVEL} (${BW_LIMIT})
+  Server IP:       ${SERVER_IP}
+  Service:         tommy-pf-tunnel
+INFOEOF
 
-    ACTIVE_PROTOCOLS+=("PF-SSH:${PF_LOCAL_PORT}->${PF_REMOTE_HOST}:${PF_REMOTE_PORT}")
+    if [[ "$SECURITY_LEVEL" == "3" ]]; then
+        cat >> /root/tommy-pf-tunnel-info.txt <<INFOEOF
+  Reality SNI:     ${PF_REALITY_DEST}
+  Public Key:      ${PF_PUBLIC_KEY}
+  Short ID:        ${PF_SHORT_ID}
+INFOEOF
+    fi
+
+    cat >> /root/tommy-pf-tunnel-info.txt <<INFOEOF
+----------------------------------------------------------------
+  IRANIAN SERVER SETUP:
+  Run tommy-client-iran.sh -> Option 8 (Port Forwarding)
+
+  Enter these values on the Iranian server:
+  - Foreign Server IP: ${SERVER_IP}
+  - Tunnel Port:       ${TUNNEL_PORT}
+  - Private Key:       ${TUNNEL_PRIVATE_KEY}
+  - Security Level:    ${SECURITY_LEVEL}
+  - Speed Level:       ${SPEED_LEVEL}
+================================================================
+INFOEOF
+
+    # Display summary
+    echo ""
+    echo -e "${GREEN}=============================================${NC}"
+    echo -e "${GREEN}  AUTHENTICATED TUNNEL - Foreign Server Side${NC}"
+    echo -e "${GREEN}=============================================${NC}"
+    echo -e "  Tunnel Port:     ${CYAN}${TUNNEL_PORT}${NC}"
+    echo -e "  Iranian IP:      ${CYAN}${IRAN_IP}${NC}"
+    echo -e "  Private Key:     ${CYAN}${TUNNEL_PRIVATE_KEY}${NC}"
+    echo -e "  Security Level:  ${CYAN}${SECURITY_LEVEL} (${SECURITY_LABEL})${NC}"
+    echo -e "  Speed Level:     ${CYAN}${SPEED_LEVEL} (${BW_LIMIT})${NC}"
+    if [[ -n "$ADDITIONAL_INFO" ]]; then
+        echo -e "$ADDITIONAL_INFO"
+    fi
+    echo ""
+    echo -e "${YELLOW}  COPY the Private Key and use it on the Iranian server!${NC}"
+    echo -e "${YELLOW}  Run tommy-client-iran.sh -> Option 8 (Port Forwarding)${NC}"
+    echo ""
+
+    ACTIVE_PROTOCOLS+=("PF-Tunnel:${TUNNEL_PORT}/${SECURITY_LABEL}")
 }
 
-# ── 8b. Xray dokodemo-door Port Forwarding (through VLESS+Reality) ───────────
-pf_xray_dokodemo() {
-    info "Setting up Xray dokodemo-door Port Forwarding..."
+# ── PF Sub-function: VMess + AES-128-GCM Server ──────────────────────────────
+_pf_vmess_server() {
+    info "Configuring VMess + AES-128-GCM tunnel bridge..."
 
-    # Ensure Xray is installed and configured
-    if ! command -v xray &>/dev/null; then
-        warn "Xray not installed. Setting up VLESS+Reality first..."
-        setup_xray
-    fi
+    mkdir -p /etc/tommy/pf-tunnel
 
-    if [[ ! -f /usr/local/etc/xray/config.json ]]; then
-        warn "Xray config not found. Please set up VLESS+Reality first."
-        return
-    fi
-
-    read -rp "Local listen port (on this server): " PF_XRAY_LOCAL_PORT
-    read -rp "Target host [127.0.0.1]: " PF_XRAY_TARGET
-    PF_XRAY_TARGET="${PF_XRAY_TARGET:-127.0.0.1}"
-    read -rp "Target port: " PF_XRAY_TARGET_PORT
-
-    if [[ -z "$PF_XRAY_LOCAL_PORT" || -z "$PF_XRAY_TARGET_PORT" ]]; then
-        warn "Both local and target ports are required."
-        return
-    fi
-
-    # Create a separate Xray instance config for port forwarding
-    mkdir -p /etc/tommy/xray-pf
-    cat > /etc/tommy/xray-pf/pf-${PF_XRAY_LOCAL_PORT}.json <<PFEOF
+    cat > /etc/tommy/pf-tunnel/config.json <<PFEOF
 {
   "log": { "loglevel": "warning" },
   "inbounds": [{
     "listen": "0.0.0.0",
-    "port": ${PF_XRAY_LOCAL_PORT},
-    "protocol": "dokodemo-door",
+    "port": ${TUNNEL_PORT},
+    "protocol": "vmess",
     "settings": {
-      "address": "${PF_XRAY_TARGET}",
-      "port": ${PF_XRAY_TARGET_PORT},
-      "network": "tcp,udp"
+      "clients": [{ "id": "${TUNNEL_UUID}", "alterId": 0 }],
+      "default": "none",
+      "allowedIps": ["${IRAN_IP}"]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "none"
     },
     "sniffing": { "enabled": true, "destOverride": ["http","tls"] }
   }],
   "outbounds": [
-    { "protocol": "freedom", "settings": { "domainStrategy": "UseIPv4" } },
+    {
+      "protocol": "freedom",
+      "settings": { "domainStrategy": "UseIPv4" },
+      "streamSettings": {
+        "sockopt": {
+          "tcpFastOpen": true,
+          "tcpKeepAliveInterval": 30
+        }
+      }
+    },
     { "protocol": "blackhole", "settings": {} }
-  ]
+  ],
+  "policy": {
+    "levels": {
+      "0": {
+        "streamRecvWindow": ${STREAM_RECV},
+        "connRecvWindow": ${CONN_RECV}
+      }
+    },
+    "system": {
+      "statsInboundUplink": false,
+      "statsInboundDownlink": false
+    }
+  }
 }
 PFEOF
 
-    local SVC_NAME="tommy-pf-xray-${PF_XRAY_LOCAL_PORT}"
-    cat > /etc/systemd/system/${SVC_NAME}.service <<SVCEOF
-[Unit]
-Description=Tommy - Xray dokodemo-door PF (${PF_XRAY_LOCAL_PORT} -> ${PF_XRAY_TARGET}:${PF_XRAY_TARGET_PORT})
-After=network.target tommy-xray.service
-Wants=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/xray run -c /etc/tommy/xray-pf/pf-${PF_XRAY_LOCAL_PORT}.json
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-
-    systemctl daemon-reload
-    open_firewall "$PF_XRAY_LOCAL_PORT" tcp
-    open_firewall "$PF_XRAY_LOCAL_PORT" udp
-    systemctl enable "${SVC_NAME}"
-    systemctl restart "${SVC_NAME}"
-    sleep 2
-
-    if systemctl is-active --quiet "${SVC_NAME}"; then
-        info "Xray dokodemo-door PF service '${SVC_NAME}' is running!"
-        info "Port ${PF_XRAY_LOCAL_PORT} forwards to ${PF_XRAY_TARGET}:${PF_XRAY_TARGET_PORT}"
-    else
-        warn "Xray PF may have failed. Check: journalctl -u ${SVC_NAME} -n 20"
-    fi
-
-    # Save info
-    cat >> /root/port-forward-client-info.txt <<CEOF
-
-================================================================
-  Xray dokodemo-door Port Forward - ${SVC_NAME}
-================================================================
-  Method:         Xray dokodemo-door
-  Listen Port:    ${PF_XRAY_LOCAL_PORT}
-  Target:         ${PF_XRAY_TARGET}:${PF_XRAY_TARGET_PORT}
-  Protocol:       TCP+UDP
-  Service:        ${SVC_NAME}
-  Config:         /etc/tommy/xray-pf/pf-${PF_XRAY_LOCAL_PORT}.json
-----------------------------------------------------------------
-  Client usage: Connect via VLESS+Reality, then access the
-  forwarded service at this server's IP:${PF_XRAY_LOCAL_PORT}
-================================================================
-CEOF
-
-    ACTIVE_PROTOCOLS+=("PF-Xray:${PF_XRAY_LOCAL_PORT}->${PF_XRAY_TARGET}:${PF_XRAY_TARGET_PORT}")
+    chmod 600 /etc/tommy/pf-tunnel/config.json
+    info "VMess tunnel bridge configured on port ${TUNNEL_PORT}"
 }
 
-# ── 8c. iptables NAT Port Forwarding (through WireGuard) ─────────────────────
-pf_iptables_nat() {
-    info "Setting up iptables NAT Port Forwarding..."
+# ── PF Sub-function: VLESS + TLS Server ──────────────────────────────────────
+_pf_vless_tls_server() {
+    info "Configuring VLESS + TLS tunnel bridge..."
 
-    # Ensure WireGuard is up
-    if ! wg show wg0 &>/dev/null; then
-        warn "WireGuard (wg0) not running. Please set up WireGuard first."
-        return
-    fi
+    # Generate self-signed certificate
+    local CERT_DIR="/etc/tommy/pf-tunnel/certs"
+    mkdir -p "$CERT_DIR"
+    openssl ecparam -genkey -name prime256v1 -out "${CERT_DIR}/server.key" 2>/dev/null
+    openssl req -new -x509 -days 3650 -key "${CERT_DIR}/server.key" \
+        -out "${CERT_DIR}/server.crt" -subj "/CN=bing.com" 2>/dev/null
 
-    # Ensure IP forwarding is enabled
-    sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
+    mkdir -p /etc/tommy/pf-tunnel
 
-    read -rp "External port (on this server): " PF_IPT_EXT_PORT
-    read -rp "Target IP (WireGuard client IP, e.g. 10.66.66.2): " PF_IPT_TARGET_IP
-    read -rp "Target port [same as external]: " PF_IPT_TARGET_PORT
-    PF_IPT_TARGET_PORT="${PF_IPT_TARGET_PORT:-$PF_IPT_EXT_PORT}"
-    read -rp "Protocol (tcp/udp/both) [tcp]: " PF_IPT_PROTO
-    PF_IPT_PROTO="${PF_IPT_PROTO:-tcp}"
+    cat > /etc/tommy/pf-tunnel/config.json <<PFEOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [{
+    "listen": "0.0.0.0",
+    "port": ${TUNNEL_PORT},
+    "protocol": "vless",
+    "settings": {
+      "clients": [{ "id": "${TUNNEL_UUID}", "flow": "" }],
+      "decryption": "none",
+      "allowedIps": ["${IRAN_IP}"]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "tls",
+      "tlsSettings": {
+        "certificates": [{
+          "certificateFile": "${CERT_DIR}/server.crt",
+          "keyFile": "${CERT_DIR}/server.key"
+        }]
+      }
+    },
+    "sniffing": { "enabled": true, "destOverride": ["http","tls"] }
+  }],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": { "domainStrategy": "UseIPv4" },
+      "streamSettings": {
+        "sockopt": {
+          "tcpFastOpen": true,
+          "tcpKeepAliveInterval": 30
+        }
+      }
+    },
+    { "protocol": "blackhole", "settings": {} }
+  ],
+  "policy": {
+    "levels": {
+      "0": {
+        "streamRecvWindow": ${STREAM_RECV},
+        "connRecvWindow": ${CONN_RECV}
+      }
+    },
+    "system": {
+      "statsInboundUplink": false,
+      "statsInboundDownlink": false
+    }
+  }
+}
+PFEOF
 
-    if [[ -z "$PF_IPT_EXT_PORT" || -z "$PF_IPT_TARGET_IP" ]]; then
-        warn "External port and target IP are required."
-        return
-    fi
-
-    local SVC_NAME="tommy-pf-iptables-${PF_IPT_EXT_PORT}"
-
-    # Create the iptables rules script
-    mkdir -p /etc/tommy/iptables-pf
-    cat > /etc/tommy/iptables-pf/rules-${PF_IPT_EXT_PORT}.sh <<RULEEOF
-#!/usr/bin/env bash
-# Tommy v3.0 - iptables NAT Port Forwarding Rules
-# External: ${PF_IPT_EXT_PORT} -> ${PF_IPT_TARGET_IP}:${PF_IPT_TARGET_PORT}
-
-EXT_PORT="${PF_IPT_EXT_PORT}"
-TARGET_IP="${PF_IPT_TARGET_IP}"
-TARGET_PORT="${PF_IPT_TARGET_PORT}"
-
-apply_rules() {
-RULEEOF
-
-    if [[ "$PF_IPT_PROTO" == "both" || "$PF_IPT_PROTO" == "tcp" ]]; then
-        cat >> /etc/tommy/iptables-pf/rules-${PF_IPT_EXT_PORT}.sh <<RULEEOF
-    iptables -t nat -A PREROUTING -p tcp --dport \${EXT_PORT} -j DNAT --to-destination \${TARGET_IP}:\${TARGET_PORT}
-    iptables -t nat -A POSTROUTING -p tcp -d \${TARGET_IP} --dport \${TARGET_PORT} -j MASQUERADE
-    iptables -A FORWARD -p tcp -d \${TARGET_IP} --dport \${TARGET_PORT} -j ACCEPT
-RULEEOF
-    fi
-
-    if [[ "$PF_IPT_PROTO" == "both" || "$PF_IPT_PROTO" == "udp" ]]; then
-        cat >> /etc/tommy/iptables-pf/rules-${PF_IPT_EXT_PORT}.sh <<RULEEOF
-    iptables -t nat -A PREROUTING -p udp --dport \${EXT_PORT} -j DNAT --to-destination \${TARGET_IP}:\${TARGET_PORT}
-    iptables -t nat -A POSTROUTING -p udp -d \${TARGET_IP} --dport \${TARGET_PORT} -j MASQUERADE
-    iptables -A FORWARD -p udp -d \${TARGET_IP} --dport \${TARGET_PORT} -j ACCEPT
-RULEEOF
-    fi
-
-    cat >> /etc/tommy/iptables-pf/rules-${PF_IPT_EXT_PORT}.sh <<RULEEOF
+    chmod 600 /etc/tommy/pf-tunnel/config.json
+    info "VLESS+TLS tunnel bridge configured on port ${TUNNEL_PORT}"
 }
 
-remove_rules() {
-RULEEOF
+# ── PF Sub-function: VLESS + Reality Server ──────────────────────────────────
+_pf_vless_reality_server() {
+    info "Configuring VLESS + Reality tunnel bridge..."
 
-    if [[ "$PF_IPT_PROTO" == "both" || "$PF_IPT_PROTO" == "tcp" ]]; then
-        cat >> /etc/tommy/iptables-pf/rules-${PF_IPT_EXT_PORT}.sh <<RULEEOF
-    iptables -t nat -D PREROUTING -p tcp --dport \${EXT_PORT} -j DNAT --to-destination \${TARGET_IP}:\${TARGET_PORT} 2>/dev/null || true
-    iptables -t nat -D POSTROUTING -p tcp -d \${TARGET_IP} --dport \${TARGET_PORT} -j MASQUERADE 2>/dev/null || true
-    iptables -D FORWARD -p tcp -d \${TARGET_IP} --dport \${TARGET_PORT} -j ACCEPT 2>/dev/null || true
-RULEEOF
-    fi
+    # Generate x25519 key pair
+    local X25519_OUTPUT
+    X25519_OUTPUT=$(xray x25519)
+    PF_PRIVATE_KEY=$(echo "$X25519_OUTPUT" | grep "Private key" | awk '{print $3}')
+    PF_PUBLIC_KEY=$(echo "$X25519_OUTPUT" | grep "Public key" | awk '{print $3}')
 
-    if [[ "$PF_IPT_PROTO" == "both" || "$PF_IPT_PROTO" == "udp" ]]; then
-        cat >> /etc/tommy/iptables-pf/rules-${PF_IPT_EXT_PORT}.sh <<RULEEOF
-    iptables -t nat -D PREROUTING -p udp --dport \${EXT_PORT} -j DNAT --to-destination \${TARGET_IP}:\${TARGET_PORT} 2>/dev/null || true
-    iptables -t nat -D POSTROUTING -p udp -d \${TARGET_IP} --dport \${TARGET_PORT} -j MASQUERADE 2>/dev/null || true
-    iptables -D FORWARD -p udp -d \${TARGET_IP} --dport \${TARGET_PORT} -j ACCEPT 2>/dev/null || true
-RULEEOF
-    fi
+    # Generate short ID
+    PF_SHORT_ID=$(openssl rand -hex 8)
 
-    cat >> /etc/tommy/iptables-pf/rules-${PF_IPT_EXT_PORT}.sh <<RULEEOF
+    # Ask for SNI dest
+    echo ""
+    info "Choose SNI/dest for Reality (major website with TLS 1.3 & H2)."
+    info "  Recommended: www.microsoft.com, www.amazon.com, www.apple.com, dl.google.com"
+    read -rp "Enter SNI [www.microsoft.com]: " PF_REALITY_DEST
+    PF_REALITY_DEST="${PF_REALITY_DEST:-www.microsoft.com}"
+
+    mkdir -p /etc/tommy/pf-tunnel
+
+    cat > /etc/tommy/pf-tunnel/config.json <<PFEOF
+{
+  "log": { "loglevel": "warning" },
+  "inbounds": [{
+    "listen": "0.0.0.0",
+    "port": ${TUNNEL_PORT},
+    "protocol": "vless",
+    "settings": {
+      "clients": [{ "id": "${TUNNEL_UUID}", "flow": "xtls-rprx-vision" }],
+      "decryption": "none",
+      "allowedIps": ["${IRAN_IP}"]
+    },
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "show": false,
+        "dest": "${PF_REALITY_DEST}:443",
+        "xver": 0,
+        "serverNames": ["${PF_REALITY_DEST}"],
+        "privateKey": "${PF_PRIVATE_KEY}",
+        "shortIds": ["${PF_SHORT_ID}", ""]
+      }
+    },
+    "sniffing": { "enabled": true, "destOverride": ["http","tls","quic"] }
+  }],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "settings": { "domainStrategy": "UseIPv4" },
+      "streamSettings": {
+        "sockopt": {
+          "tcpFastOpen": true,
+          "tcpKeepAliveInterval": 30
+        }
+      }
+    },
+    { "protocol": "blackhole", "settings": {} }
+  ],
+  "policy": {
+    "levels": {
+      "0": {
+        "streamRecvWindow": ${STREAM_RECV},
+        "connRecvWindow": ${CONN_RECV}
+      }
+    },
+    "system": {
+      "statsInboundUplink": false,
+      "statsInboundDownlink": false
+    }
+  }
 }
+PFEOF
 
-case "\${1}" in
-    start)  apply_rules ;;
-    stop)   remove_rules ;;
-    *)      apply_rules ;;
-esac
-RULEEOF
-
-    chmod +x /etc/tommy/iptables-pf/rules-${PF_IPT_EXT_PORT}.sh
-
-    # Create systemd service
-    cat > /etc/systemd/system/${SVC_NAME}.service <<SVCEOF
-[Unit]
-Description=Tommy - iptables NAT PF (${PF_IPT_EXT_PORT} -> ${PF_IPT_TARGET_IP}:${PF_IPT_TARGET_PORT})
-After=network.target tommy-wireguard.service
-Wants=network.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/etc/tommy/iptables-pf/rules-${PF_IPT_EXT_PORT}.sh start
-ExecStop=/etc/tommy/iptables-pf/rules-${PF_IPT_EXT_PORT}.sh stop
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-
-    systemctl daemon-reload
-    if [[ "$PF_IPT_PROTO" == "both" || "$PF_IPT_PROTO" == "tcp" ]]; then
-        open_firewall "$PF_IPT_EXT_PORT" tcp
-    fi
-    if [[ "$PF_IPT_PROTO" == "both" || "$PF_IPT_PROTO" == "udp" ]]; then
-        open_firewall "$PF_IPT_EXT_PORT" udp
-    fi
-    systemctl enable "${SVC_NAME}"
-    systemctl start "${SVC_NAME}"
-
-    if systemctl is-active --quiet "${SVC_NAME}"; then
-        info "iptables NAT PF service '${SVC_NAME}' is active!"
-        info "Port ${PF_IPT_EXT_PORT} -> ${PF_IPT_TARGET_IP}:${PF_IPT_TARGET_PORT}"
-    else
-        warn "iptables NAT PF may have failed. Check: journalctl -u ${SVC_NAME} -n 20"
-    fi
-
-    # Save info
-    cat >> /root/port-forward-client-info.txt <<CEOF
-
-================================================================
-  iptables NAT Port Forward - ${SVC_NAME}
-================================================================
-  Method:         iptables DNAT/MASQUERADE
-  External Port:  ${PF_IPT_EXT_PORT}
-  Target:         ${PF_IPT_TARGET_IP}:${PF_IPT_TARGET_PORT}
-  Protocol:       ${PF_IPT_PROTO}
-  Service:        ${SVC_NAME}
-  Rules Script:   /etc/tommy/iptables-pf/rules-${PF_IPT_EXT_PORT}.sh
-----------------------------------------------------------------
-  Forwarding through WireGuard (wg0) tunnel.
-  Client must be connected via WireGuard to reach target.
-================================================================
-CEOF
-
-    ACTIVE_PROTOCOLS+=("PF-iptables:${PF_IPT_EXT_PORT}->${PF_IPT_TARGET_IP}:${PF_IPT_TARGET_PORT}")
-}
-
-# ── 8d. socat TCP/UDP Relay ──────────────────────────────────────────────────
-pf_socat() {
-    info "Setting up socat TCP/UDP Relay..."
-
-    # Ensure socat is installed
-    if ! command -v socat &>/dev/null; then
-        info "Installing socat..."
-        if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
-            apt-get install -y socat 2>/dev/null || true
-        elif [[ "$OS_ID" == "centos" || "$OS_ID" == "rhel" || "$OS_ID" == "rocky" || "$OS_ID" == "almalinux" ]]; then
-            yum install -y socat 2>/dev/null || true
-        elif [[ "$OS_ID" == "arch" ]]; then
-            pacman -Sy --noconfirm socat 2>/dev/null || true
-        fi
-    fi
-
-    if ! command -v socat &>/dev/null; then
-        warn "socat installation failed. Skipping."
-        return
-    fi
-
-    read -rp "Local listen port (on this server): " PF_SOCAT_LOCAL_PORT
-    read -rp "Target host [127.0.0.1]: " PF_SOCAT_TARGET
-    PF_SOCAT_TARGET="${PF_SOCAT_TARGET:-127.0.0.1}"
-    read -rp "Target port: " PF_SOCAT_TARGET_PORT
-    read -rp "Protocol (tcp/udp) [tcp]: " PF_SOCAT_PROTO
-    PF_SOCAT_PROTO="${PF_SOCAT_PROTO:-tcp}"
-    read -rp "Bind address [0.0.0.0]: " PF_SOCAT_BIND
-    PF_SOCAT_BIND="${PF_SOCAT_BIND:-0.0.0.0}"
-
-    if [[ -z "$PF_SOCAT_LOCAL_PORT" || -z "$PF_SOCAT_TARGET_PORT" ]]; then
-        warn "Both local and target ports are required."
-        return
-    fi
-
-    local SVC_NAME="tommy-pf-socat-${PF_SOCAT_LOCAL_PORT}"
-
-    if [[ "$PF_SOCAT_PROTO" == "udp" ]]; then
-        cat > /etc/systemd/system/${SVC_NAME}.service <<SVCEOF
-[Unit]
-Description=Tommy - socat UDP Relay (${PF_SOCAT_LOCAL_PORT} -> ${PF_SOCAT_TARGET}:${PF_SOCAT_TARGET_PORT})
-After=network.target
-Wants=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/socat UDP4-LISTEN:${PF_SOCAT_LOCAL_PORT},bind=${PF_SOCAT_BIND},fork,reuseaddr UDP4:${PF_SOCAT_TARGET}:${PF_SOCAT_TARGET_PORT}
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-    else
-        cat > /etc/systemd/system/${SVC_NAME}.service <<SVCEOF
-[Unit]
-Description=Tommy - socat TCP Relay (${PF_SOCAT_LOCAL_PORT} -> ${PF_SOCAT_TARGET}:${PF_SOCAT_TARGET_PORT})
-After=network.target
-Wants=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/socat TCP4-LISTEN:${PF_SOCAT_LOCAL_PORT},bind=${PF_SOCAT_BIND},fork,reuseaddr TCP4:${PF_SOCAT_TARGET}:${PF_SOCAT_TARGET_PORT}
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=65535
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-    fi
-
-    systemctl daemon-reload
-    open_firewall "$PF_SOCAT_LOCAL_PORT" "$PF_SOCAT_PROTO"
-    systemctl enable "${SVC_NAME}"
-    systemctl restart "${SVC_NAME}"
-    sleep 2
-
-    if systemctl is-active --quiet "${SVC_NAME}"; then
-        info "socat relay service '${SVC_NAME}' is running!"
-        info "${PF_SOCAT_PROTO^^} ${PF_SOCAT_BIND}:${PF_SOCAT_LOCAL_PORT} -> ${PF_SOCAT_TARGET}:${PF_SOCAT_TARGET_PORT}"
-    else
-        warn "socat relay may have failed. Check: journalctl -u ${SVC_NAME} -n 20"
-    fi
-
-    # Save info
-    cat >> /root/port-forward-client-info.txt <<CEOF
-
-================================================================
-  socat TCP/UDP Relay - ${SVC_NAME}
-================================================================
-  Method:         socat ${PF_SOCAT_PROTO^^} relay
-  Bind:           ${PF_SOCAT_BIND}
-  Listen Port:    ${PF_SOCAT_LOCAL_PORT}
-  Target:         ${PF_SOCAT_TARGET}:${PF_SOCAT_TARGET_PORT}
-  Protocol:       ${PF_SOCAT_PROTO}
-  Service:        ${SVC_NAME}
-----------------------------------------------------------------
-  Quick test:
-    socat - ${PF_SOCAT_PROTO^^}:${SERVER_IP}:${PF_SOCAT_LOCAL_PORT}
-================================================================
-CEOF
-
-    ACTIVE_PROTOCOLS+=("PF-socat:${PF_SOCAT_LOCAL_PORT}->${PF_SOCAT_TARGET}:${PF_SOCAT_TARGET_PORT}")
+    chmod 600 /etc/tommy/pf-tunnel/config.json
+    info "VLESS+Reality tunnel bridge configured on port ${TUNNEL_PORT}"
 }
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -1695,7 +1704,7 @@ show_summary() {
     for proto in "${ACTIVE_PROTOCOLS[@]}"; do
         local padding=$((30 - ${#proto}))
         [[ $padding -lt 1 ]] && padding=1
-        echo -e "${CYAN}║  ${GREEN}✅${NC} ${proto}$(printf '%*s' "$padding" '')${CYAN}║${NC}"
+        echo -e "${CYAN}║  ${GREEN}*${NC} ${proto}$(printf '%*s' "$padding" '')${CYAN}║${NC}"
     done
 
     echo -e "${CYAN}║                                                              ║${NC}"
@@ -1712,17 +1721,17 @@ show_summary() {
     echo ""
     info "Protocol Comparison:"
     echo ""
-    echo "  ┌────────────────────┬────────────┬──────────┬──────────────────┐"
-    echo "  │ Protocol           │ Transport  │ Stealth  │ Speed            │"
-    echo "  ├────────────────────┼────────────┼──────────┼──────────────────┤"
-    echo "  │ VLESS+Reality      │ TCP        │ ★★★★★   │ ★★★★            │"
-    echo "  │ Hysteria2          │ UDP/QUIC   │ ★★★★    │ ★★★★★           │"
-    echo "  │ Shadowsocks-2022   │ TCP+UDP    │ ★★★     │ ★★★★            │"
-    echo "  │ TUIC               │ UDP/QUIC   │ ★★★     │ ★★★★            │"
-    echo "  │ WireGuard          │ UDP        │ ★★       │ ★★★★★ (kernel)  │"
-    echo "  │ Brook              │ TCP+UDP    │ ★★★     │ ★★★             │"
-    echo "  │ SSH Tunnel         │ TCP        │ ★★       │ ★★              │"
-    echo "  └────────────────────┴────────────┴──────────┴──────────────────┘"
+    echo "  +--------------------+------------+----------+------------------+"
+    echo "  | Protocol           | Transport  | Stealth  | Speed            |"
+    echo "  +--------------------+------------+----------+------------------+"
+    echo "  | VLESS+Reality      | TCP        | *****    | ****             |"
+    echo "  | Hysteria2          | UDP/QUIC   | ****     | *****            |"
+    echo "  | Shadowsocks-2022   | TCP+UDP    | ***      | ****             |"
+    echo "  | TUIC               | UDP/QUIC   | ***      | ****             |"
+    echo "  | WireGuard          | UDP        | **       | ***** (kernel)   |"
+    echo "  | Brook              | TCP+UDP    | ***      | ***              |"
+    echo "  | SSH Tunnel         | TCP        | **       | **               |"
+    echo "  +--------------------+------------+----------+------------------+"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
