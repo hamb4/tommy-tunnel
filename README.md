@@ -1,106 +1,186 @@
-# GO Simple Tunnel
+# Tommy Tunnel v1.0.5
 
-### GO语言实现的安全隧道
+**Author:** hamb4
+**License:** Apache License 2.0
+**Repository:** [https://github.com/hamb4/tommy-tunnel](https://github.com/hamb4/tommy-tunnel)
 
-[![zh](https://img.shields.io/badge/Chinese%20README-green)](README.md) [![en](https://img.shields.io/badge/English%20README-gray)](README_en.md)
+---
 
-## 功能特性
+## What is Tommy?
 
-- [x] [多端口监听](https://gost.run/getting-started/quick-start/)
-- [x] [多级转发链](https://gost.run/concepts/chain/)
-- [x] [多协议支持](https://gost.run/tutorials/protocols/overview/)
-- [x] [TCP/UDP端口转发](https://gost.run/tutorials/port-forwarding/)
-- [x] [反向代理](https://gost.run/tutorials/reverse-proxy/)和[隧道](https://gost.run/tutorials/reverse-proxy-tunnel/)
-- [x] [TCP/UDP透明代理](https://gost.run/tutorials/redirect/)
-- [x] DNS[解析](https://gost.run/concepts/resolver/)和[代理](https://gost.run/tutorials/dns/)
-- [x] [TUN/TAP设备](https://gost.run/tutorials/tuntap/)与[TUN2SOCKS](https://gost.run/tutorials/tungo/)
-- [x] [负载均衡](https://gost.run/concepts/selector/)
-- [x] [路由控制](https://gost.run/concepts/bypass/)
-- [x] [准入控制](https://gost.run/concepts/admission/)
-- [x] [限速限流](https://gost.run/concepts/limiter/)
-- [x] [插件系统](https://gost.run/concepts/plugin/)
-- [x] [Prometheus监控指标](https://gost.run/tutorials/metrics/)
-- [x] [动态配置](https://gost.run/tutorials/api/config/)
-- [x] [Web API](https://gost.run/tutorials/api/overview/)
-- [x] [GUI](https://github.com/go-gost/gostctl)/[WebUI](https://github.com/go-gost/gost-ui)
+Tommy is a port forwarding tunnel tool that connects an Iranian server to an external server. Tommy **works alongside the External Proxy feature in 3x-ui** — the tunnel itself does not require x-ray. The tunnel just forwards a port between the two servers, and you enter the Iranian server IP and the tunnel port in the 3x-ui stream settings.
 
-## 概览
+### How it works
 
-![Overview](https://gost.run/images/overview.png)
+```
+User in Iran → Iran server (Tommy client) → Tunnel → Foreign server (Tommy server) → 3x-ui → Free Internet
+```
 
-GOST作为隧道有三种主要使用方式。
+1. **Foreign server**: Runs the script `tommy-server-setup.sh` to create a tunnel point
+2. **Iran server**: Runs the script `tommy-client-iran.sh` and enters the **Connection code** from the foreign server
+3. **3x-ui**: In Stream settings → External Proxy, set the Iran server IP + tunnel port
+4. Users in Iran pass through the tunnel through the Iran server and connect to the 3x-ui foreign server and then the free Internet
 
-### 正向代理
+---
 
-作为代理服务访问网络，可以组合使用多种协议组成转发链进行转发。
+## Features
 
-![Proxy](https://gost.run/images/proxy.png)
+- **4 tunnel methods**: SSH Tunnel, WireGuard, Gost TLS Relay, Hysteria2
+- **Connection code**: The foreign server generates a unique code — just paste it into the Iran server and that's it Automatic configuration
+- **Tunnel Management**: Create, list, start, stop, restart and delete tunnels
+- **Service Management**: Full integration with systemd with `tommy-` prefix
+- **Tunnel Removal**: Full removal of services, configs, firewall rules and registry
+- **Port Validation**: If you do not enter a number, the default value is used
+- **Speed/Security Profile**: Balanced, Speed ​​Priority, or Security Priority
+- **BBR and Buffer Optimization**: Automatically enable BBR and adjust UDP buffer
+- **No x-ray required**: Pure port forwarding — works with External Proxy in 3x-ui
+---
 
-### 端口转发
+## Quick Guide
 
-将一个服务的端口映射到另外一个服务的端口，同样可以组合使用多种协议组成转发链进行转发。
-
-![Forward](https://gost.run/images/forward.png)
-
-### 反向代理
-
-利用隧道和内网穿透将内网服务暴露到公网访问。
-
-![Reverse Proxy](https://gost.run/images/reverse-proxy.png)
-
-## 下载安装
-
-### 二进制文件
-
-[https://github.com/go-gost/gost/releases](https://github.com/go-gost/gost/releases)
-
-### 安装脚本
+### Step 1: External Server
 
 ```bash
-# 安装最新版本 [https://github.com/go-gost/gost/releases](https://github.com/go-gost/gost/releases)
-bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh) --install
+bash <(curl -Ls https://raw.githubusercontent.com/hamb4/tommy-tunnel/main/tommy-server-setup.sh)
 ```
+
+- Select the "Create a new tunnel" option
+- Select the tunnel method
+- Enter the port forwarding (same as your 3x-ui port, default: 443)
+- Select the profile
+- Copy the **Connection Code** that is displayed at the end
+
+### Step 2: Iran Server
+
 ```bash
-# 选择要安装的版本
-bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh)
+bash <(curl -LSs https://raw.githubusercontent.com/hamb4/tommy-tunnel/main/tommy-client-iran.sh)
 ```
 
-### 源码编译
+- Select the "Connect via Connection Code" option (recommended)
+- Paste the **Connection Code** from the external server
+- Enter the tunnel name
+- The tunnel will be automatically configured with all the external server settings
 
+### Step 3: External Proxy in 3x-ui
+
+In the 3x-ui panel On the external server:
+
+1. Go to your inbound **Stream Settings**
+2. Find the **External Proxy** section
+3. Set:
+- **IP**: Iran server public IP
+- **Port**: The port you chose to forward (e.g. 443)
+
+---
+
+## Tunnel Methods
+
+| Method | Protocol | Encryption | Speed ​​| DPI Resistance | Best for |
+|------|--------|-----|------------|------------|-------------|
+| SSH Tunnel | TCP | Yes (ED25519) | Good | Low | Easy and secure setup |
+| WireGuard | UDP | Yes (ChaCha20) | Very fast | Medium | Maximum speed |
+| Gost TLS Relay | TCP | Yes (TLS) | Good | High | Similar to HTTPS traffic |
+| Hysteria2 | UDP/QUIC | Yes (TLS) | Very fast | Very high | Best DPI resistance |
+
+---
+
+## Connection Code System
+
+**Connection Code** is a key feature of Tami version 1.0.5. This system ensures that all settings on the Iranian server **exactly match** the foreign server.
+
+### How it works
+
+1. When creating a tunnel to a foreign server, Tommy generates a **base64-encoded connection code**
+
+2. This code contains all the tunnel settings: method, server IP, port forwarding, profile and information specific to each method (keys, passwords, ports)
+
+3. On the Iranian server, just paste the code and Tommy will configure everything automatically
+
+4. No manual errors — if the code is valid, the settings are guaranteed to match
+
+### Connection code security
+
+- The connection code is stored in the path `/root/tommy-<name>-connection-code.txt` on the foreign server with access `600`
+
+- SSH private keys inside the code are base64-encoded
+- Treat connection codes like sensitive information — anyone with the code can connect to your tunnel
+
+---
+
+## Service management
+
+All tunnels are created by systemd services with the `tommy-` prefix They do:
+
+```bash
+# Check tunnel status
+systemctl status tommy-tunnel1
+
+# Start tunnel
+systemctl start tommy-tunnel1
+
+# Stop tunnel
+systemctl stop tommy-tunnel1
+
+# Restart tunnel
+systemctl restart tommy-tunnel1
+
+# View logs
+journalctl -u tommy-tunnel1 -n 50
 ```
-git clone https://github.com/go-gost/gost.git
-cd gost/cmd/gost
-go build
-```
 
-### Docker
+Or use the built-in **Service Management** (option 4 on foreign server, option 5 on Iranian server) for interactive menu.
 
-```
-docker run --rm gogost/gost -V
-```
+---
 
-## 工具
+## Tunnel Removal
 
-### GUI
+Tommy cleans up everything properly when removing a tunnel:
 
-[go-gost/gostctl](https://github.com/go-gost/gostctl)
+1. Stops and disables the systemd service
+2. Removes the service file from `/etc/systemd/system/`
+3. For WireGuard: Stops the port forwarding helper service as well
+4. Removes the tunnel config folder from `/etc/tommy/<name>/`
+5. Removes the connection code file from `/root/`
+6. Closes firewall ports
+7. Removes the tunnel from the registry
 
-### WebUI
+---
 
-[go-gost/gost-ui](https://github.com/go-gost/gost-ui)
+## File Paths
 
-### Shadowsocks Android插件
+| File | Path |
+|------|------|
+| Tunnel config | `/etc/tommy/<tunnel-name>/` |
+| Tunnel info | `/etc/tommy/<tunnel-name>/tunnel-info.txt` |
+| Tunnel Registry | `/etc/tommy/tunnels.registry` |
+| Connection code | `/root/tommy-<name>-connection-code.txt` |
+| Systemd services | `/etc/systemd/system/tommy-<name>.service` |
 
-[hamid-nazari/ShadowsocksGostPlugin](https://github.com/hamid-nazari/ShadowsocksGostPlugin)
+---
 
-## 帮助与支持
+## Troubleshooting
 
-Wiki站点：[https://gost.run](https://gost.run)
+### Tunnel "started" but not working
 
-YouTube: [https://www.youtube.com/@gost-tunnel](https://www.youtube.com/@gost-tunnel)
+1. Check that the service is actually running: `systemctl status tommy-<name>`
+2. Check the logs: `journalctl -u tommy-<name> -n 50`
+3. Check the port: `ss -tlnp | grep <port>`
+4. Make sure the firewall allows the port
 
-Telegram：[https://t.me/gogost](https://t.me/gogost)
+### Connection code not working
 
-Google讨论组：[https://groups.google.com/d/forum/go-gost](https://groups.google.com/d/forum/go-gost)
+1. Make sure you copied the entire code (it's a long base64 string)
+2. The code is version-dependent — both servers must be using Tommy v1.0.5
+3. Use the "Manual Setup" option instead
 
-旧版入口：[v2.gost.run](https://v2.gost.run)
+### WireGuard tunnel fails
+
+1. Make sure the WireGuard kernel module is available: `modprobe wireguard`
+2. Check that the UDP port is open in the firewall
+3. Check the client config: `cat /etc/tommy/<name>/wg0.conf`
+
+---
+
+## Version history
+
+- **v1.0.5** — Connection code system, tunnel name caching, port validation, proper tunnel removal, service management improvements
