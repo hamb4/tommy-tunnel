@@ -151,7 +151,7 @@ systemctl status tommy-pf-socat-8080
 
 ## مجوز
 
-مجوز MIT — آزاد برای استفاده، تغییر و توزیع.
+مجوز Apache License 2.0
 
 ---
 
