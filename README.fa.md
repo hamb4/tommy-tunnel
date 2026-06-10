@@ -45,9 +45,8 @@
 ### مرحله ۱: سرور خارج
 
 ```bash
-# آپلود و اجرا روی سرور خارجی
-chmod +x tommy-server-setup.sh
-sudo ./tommy-server-setup.sh
+# اجرا مستقیم روی سرور خارج
+bash <(curl -Ls https://raw.githubusercontent.com/hamb4/tommy-tunnel/main/tommy-server-setup.sh)
 ```
 
 پروتکل‌ها را انتخاب کنید (پیشنهاد: `1 2 3`). اسکریپت لینک‌های اتصال را چاپ کرده و اطلاعات را در `/root/*-client-info.txt` ذخیره می‌کند.
@@ -55,9 +54,8 @@ sudo ./tommy-server-setup.sh
 ### مرحله ۲: سرور ایران
 
 ```bash
-# آپلود و اجرا روی سرور ایرانی
-chmod +x tommy-client-iran.sh
-sudo ./tommy-client-iran.sh
+# اجرا مستقیم روی سرور ایران
+bash <(curl -LS https://raw.githubusercontent.com/hamb4/tommy-tunnel/main/tommy-client-iran.sh)
 ```
 
 پروتکل مشابه را انتخاب کنید، اطلاعات اتصال از مرحله ۱ را وارد کنید. اسکریپت:
@@ -99,13 +97,6 @@ curl https://api.ipify.org
 قانون ۲: 6379:redis.example.com:6379
 قانون ۳: 8080:api.service.com:443
 ```
-
-## فایل‌ها
-
-| فایل | کاربرد |
-|------|--------|
-| `tommy-server-setup.sh` | اجرا روی سرور خارج (ایجاد سرورهای تونل) |
-| `tommy-client-iran.sh` | اجرا روی سرور ایران (ایجاد کلاینت‌های تونل + فوروارد پورت) |
 
 ## مکان سرور خارج
 
