@@ -1,7 +1,7 @@
 # تامي تانل - Tommy Tunnel v1.0.5
 
 **نویسنده:** hamb4  
-**لایسنس:** MIT  
+**لایسنس:** Apache License 2.0  
 **مخزن:** [https://github.com/hamb4/tommy-tunnel](https://github.com/hamb4/tommy-tunnel)
 
 ---
