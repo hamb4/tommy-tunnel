@@ -15,16 +15,19 @@
 #  How it works:
 #    1. This script connects to the foreign server's tunnel
 #    2. It forwards a local port (e.g. 443) to the foreign server
-#    3. In 3x-ui on foreign server, set External Proxy = this server IP + port
-#    4. Users in Iran connect to this server → tunnel → foreign 3x-ui → internet
+#    3. In 3x-ui, set External Proxy = this server IP + forwarded port
+#    4. Users in Iran connect to this server -> tunnel -> foreign 3x-ui -> internet
 #
 #  Usage:
 #    bash <(curl -LSs https://raw.githubusercontent.com/hamb4/tommy-tunnel/main/tommy-client-iran.sh)
 #===============================================================================
 
+set -euo pipefail
+
 TOMMY_VER="1.0.5"
 TOMMY_AUTHOR="hamb4"
 TOMMY_DIR="/etc/tommy"
+TOMMY_REGISTRY="${TOMMY_DIR}/tunnels.registry"
 
 # Colors
 RED='\033[0;31m'
@@ -49,13 +52,63 @@ check_root() {
 
 get_local_ip() {
     local IP=""
-    IP=$(curl -s4 --connect-timeout 5 https://ifconfig.me 2>/dev/null) \
-        || IP=$(curl -s4 --connect-timeout 5 https://api.ipify.org 2>/dev/null) \
-        || IP=$(curl -s4 --connect-timeout 5 https://ip.sb 2>/dev/null)
+    IP=$(curl -s4 --connect-timeout 5 https://ifconfig.me 2>/dev/null || true)
+    if [[ -z "$IP" ]]; then
+        IP=$(curl -s4 --connect-timeout 5 https://api.ipify.org 2>/dev/null || true)
+    fi
+    if [[ -z "$IP" ]]; then
+        IP=$(curl -s4 --connect-timeout 5 https://ip.sb 2>/dev/null || true)
+    fi
     if [[ -z "$IP" ]]; then
         read -rp "Enter this server's public IP: " IP
     fi
     echo "$IP"
+}
+
+# Read port with validation - if empty or non-numeric, use default
+read_port() {
+    local prompt="$1"
+    local default="$2"
+    local var_name="$3"
+    local input=""
+    read -rp "$prompt [$default]: " input
+    input=$(echo "$input" | tr -d '[:space:]')
+    if [[ -z "$input" ]] || ! [[ "$input" =~ ^[0-9]+$ ]]; then
+        eval "${var_name}=${default}"
+    else
+        eval "${var_name}=${input}"
+    fi
+}
+
+# Register tunnel in central registry
+register_tunnel() {
+    local tname="$1"
+    local method="$2"
+    local fwd_port="$3"
+    local profile="$4"
+    mkdir -p "${TOMMY_DIR}"
+    if [[ -f "$TOMMY_REGISTRY" ]]; then
+        sed -i "/^${tname}|/d" "$TOMMY_REGISTRY" 2>/dev/null || true
+    fi
+    echo "${tname}|${method}|${fwd_port}|${profile}|$(date '+%Y-%m-%d %H:%M:%S')" >> "$TOMMY_REGISTRY"
+    chmod 600 "$TOMMY_REGISTRY"
+}
+
+unregister_tunnel() {
+    local tname="$1"
+    if [[ -f "$TOMMY_REGISTRY" ]]; then
+        sed -i "/^${tname}|/d" "$TOMMY_REGISTRY" 2>/dev/null || true
+    fi
+}
+
+tunnel_exists() {
+    local tname="$1"
+    if [[ -f "$TOMMY_REGISTRY" ]]; then
+        grep -q "^${tname}|" "$TOMMY_REGISTRY" 2>/dev/null && return 0
+    fi
+    [[ -d "${TOMMY_DIR}/${tname}" ]] && return 0
+    [[ -f "/etc/systemd/system/tommy-${tname}.service" ]] && return 0
+    return 1
 }
 
 open_firewall() {
@@ -114,7 +167,7 @@ optimize_system() {
     info "Enabling BBR congestion control..."
     if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
         if ! grep -q "tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null; then
-            cat >> /etc/sysctl.conf <<EOF
+            cat >> /etc/sysctl.conf <<SYSEOF
 # Tommy v${TOMMY_VER} - BBR
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
@@ -127,7 +180,7 @@ net.core.netdev_max_backlog=65536
 net.ipv4.udp_mem=1048576 2097152 4194304
 net.ipv4.ip_forward=1
 net.ipv6.conf.all.forwarding=1
-EOF
+SYSEOF
         fi
         sysctl -p /etc/sysctl.conf 2>/dev/null || true
         info "BBR and buffer optimization enabled."
@@ -152,6 +205,40 @@ show_banner() {
     echo ""
 }
 
+# ── Parse Connection Code ────────────────────────────────────────────────────
+parse_connection_code() {
+    local code="$1"
+    local decoded=""
+    decoded=$(echo "$code" | base64 -d 2>/dev/null) || {
+        err "Invalid connection code. Could not decode."
+        return 1
+    }
+
+    # Verify prefix
+    if [[ "$decoded" != TOMMY105* ]]; then
+        err "Invalid connection code. Wrong format or version."
+        return 1
+    fi
+
+    # Parse: TOMMY105|method|server_ip|fwd_port|profile|extra_data
+    local IFS='|'
+    read -r PREFIX CODE_METHOD CODE_SERVER_IP CODE_FWD_PORT CODE_PROFILE CODE_EXTRA <<< "$decoded"
+
+    if [[ -z "$CODE_METHOD" ]] || [[ -z "$CODE_SERVER_IP" ]] || [[ -z "$CODE_FWD_PORT" ]]; then
+        err "Connection code is missing required fields."
+        return 1
+    fi
+
+    # Export for use by caller
+    PARSED_METHOD="$CODE_METHOD"
+    PARSED_SERVER_IP="$CODE_SERVER_IP"
+    PARSED_FWD_PORT="$CODE_FWD_PORT"
+    PARSED_PROFILE="$CODE_PROFILE"
+    PARSED_EXTRA="$CODE_EXTRA"
+
+    return 0
+}
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  SSH TUNNEL CLIENT
 # ══════════════════════════════════════════════════════════════════════════════
@@ -161,6 +248,7 @@ connect_ssh_tunnel() {
     local SSH_PORT="$3"
     local FWD_PORT="$4"
     local PROFILE="$5"
+    local PRIVATE_KEY_B64="$6"
     local SVC_NAME="tommy-${TNAME}"
     local CFG_DIR="${TOMMY_DIR}/${TNAME}"
 
@@ -171,26 +259,37 @@ connect_ssh_tunnel() {
 
     mkdir -p "${CFG_DIR}"
 
-    # Get private key from user
-    echo ""
-    info "Paste the SSH private key from the foreign server."
-    info "(End with a blank line)"
-    echo ""
-    local KEY_LINES=""
-    while IFS= read -r line; do
-        if [[ -z "$line" ]]; then
-            break
-        fi
-        KEY_LINES="${KEY_LINES}${line}"$'\n'
-    done
+    # Decode private key from base64
+    local PRIVATE_KEY=""
+    if [[ -n "$PRIVATE_KEY_B64" ]]; then
+        PRIVATE_KEY=$(echo "$PRIVATE_KEY_B64" | base64 -d 2>/dev/null) || {
+            err "Failed to decode private key from connection code."
+            return 1
+        }
+    fi
 
-    if [[ -z "$KEY_LINES" ]]; then
-        err "No private key provided."
-        return 1
+    if [[ -z "$PRIVATE_KEY" ]]; then
+        # Fallback: ask user to paste the key manually
+        echo ""
+        info "Paste the SSH private key from the foreign server."
+        info "Press Enter on an empty line when done."
+        echo ""
+        local KEY_LINES=""
+        while IFS= read -r line; do
+            if [[ -z "$line" ]]; then
+                break
+            fi
+            KEY_LINES="${KEY_LINES}${line}"$'\n'
+        done
+        if [[ -z "$KEY_LINES" ]]; then
+            err "No private key provided."
+            return 1
+        fi
+        PRIVATE_KEY="$KEY_LINES"
     fi
 
     # Save private key
-    echo "$KEY_LINES" > "${CFG_DIR}/id_tommy"
+    echo "$PRIVATE_KEY" > "${CFG_DIR}/id_tommy"
     chmod 600 "${CFG_DIR}/id_tommy"
 
     # Profile settings
@@ -202,9 +301,6 @@ connect_ssh_tunnel() {
     fi
 
     # Create systemd service for autossh
-    # -L 0.0.0.0:FWD_PORT:localhost:FWD_PORT means:
-    #   Listen on 0.0.0.0:FWD_PORT on this server
-    #   Forward to localhost:FWD_PORT on the foreign server
     cat > "/etc/systemd/system/${SVC_NAME}.service" <<SVCEOF
 [Unit]
 Description=Tommy SSH Tunnel - ${TNAME}
@@ -255,6 +351,9 @@ CREATED=$(date '+%Y-%m-%d %H:%M:%S')
 IEOF
     chmod 600 "${CFG_DIR}/tunnel-info.txt"
 
+    # Register in central registry
+    register_tunnel "$TNAME" "ssh" "$FWD_PORT" "$PROFILE"
+
     # Display success
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
@@ -282,6 +381,12 @@ connect_wireguard_tunnel() {
     local WG_PORT="$3"
     local FWD_PORT="$4"
     local PROFILE="$5"
+    local MTU="$6"
+    local KEEPALIVE="$7"
+    local SRV_WG_IP="$8"
+    local CLI_WG_IP="$9"
+    local CLI_PRIV="${10}"
+    local SRV_PUB="${11}"
     local SVC_NAME="tommy-${TNAME}"
     local CFG_DIR="${TOMMY_DIR}/${TNAME}"
 
@@ -305,33 +410,26 @@ connect_wireguard_tunnel() {
 
     mkdir -p "${CFG_DIR}"
 
-    # Get client config from user
-    echo ""
-    info "Paste the WireGuard client config from the foreign server."
-    info "(The [Interface] and [Peer] sections)"
-    info "(End with a blank line)"
-    echo ""
-    local WG_CONFIG=""
-    while IFS= read -r line; do
-        if [[ -z "$line" ]]; then
-            break
-        fi
-        WG_CONFIG="${WG_CONFIG}${line}"$'\n'
-    done
+    # Build client config from parsed connection code data
+    cat > "${CFG_DIR}/wg0.conf" <<WGEOF
+[Interface]
+PrivateKey = ${CLI_PRIV}
+Address = ${CLI_WG_IP}/24
+MTU = ${MTU}
+DNS = 1.1.1.1
 
-    if [[ -z "$WG_CONFIG" ]]; then
-        err "No WireGuard config provided."
-        return 1
-    fi
-
-    # Save client config
-    echo "$WG_CONFIG" > "${CFG_DIR}/wg0.conf"
+[Peer]
+PublicKey = ${SRV_PUB}
+Endpoint = ${FOREIGN_IP}:${WG_PORT}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = ${KEEPALIVE}
+WGEOF
     chmod 600 "${CFG_DIR}/wg0.conf"
 
     # Copy to WireGuard directory
-    cp "${CFG_DIR}/wg0.conf" /etc/wireguard/wg0.conf 2>/dev/null
+    cp "${CFG_DIR}/wg0.conf" "/etc/wireguard/wg0-${TNAME}.conf" 2>/dev/null || true
 
-    # Create systemd service
+    # Create systemd service for WireGuard
     cat > "/etc/systemd/system/${SVC_NAME}.service" <<SVCEOF
 [Unit]
 Description=Tommy WireGuard Tunnel - ${TNAME}
@@ -339,27 +437,21 @@ After=network.target
 Wants=network.target
 
 [Service]
-Type=notify
+Type=oneshot
+RemainAfterExit=yes
 ExecStart=/usr/bin/wg-quick up ${CFG_DIR}/wg0.conf
 ExecStop=/usr/bin/wg-quick down ${CFG_DIR}/wg0.conf
-RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
 
-    # Also set up port forwarding through WireGuard
-    # After WireGuard is connected, forward FWD_PORT through the tunnel
-    local SRV_WG_IP="10.10.0.1"
+    # Create port forwarding helper service using socat
+    install_pkg socat
     info "Setting up port forwarding through WireGuard..."
-
-    # Enable IP forwarding for WireGuard routing
     sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true
     sysctl -w net.ipv6.conf.all.forwarding=1 2>/dev/null || true
 
-    # Create a port forwarding helper service using socat
-    install_pkg socat
-    # Forward incoming traffic on FWD_PORT to the foreign server's WG IP on FWD_PORT
     cat > "/etc/systemd/system/${SVC_NAME}-fwd.service" <<FWDEOF
 [Unit]
 Description=Tommy Port Forward - ${TNAME}
@@ -405,6 +497,9 @@ LOCAL_IP=${LOCAL_IP}
 CREATED=$(date '+%Y-%m-%d %H:%M:%S')
 IEOF
     chmod 600 "${CFG_DIR}/tunnel-info.txt"
+
+    # Register in central registry
+    register_tunnel "$TNAME" "wireguard" "$FWD_PORT" "$PROFILE"
 
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
@@ -473,8 +568,6 @@ connect_gost_tunnel() {
     fi
 
     # Create Gost client config
-    # This listens on FWD_PORT locally and forwards through the TLS relay
-    # to localhost:FWD_PORT on the foreign server (where 3x-ui listens)
     cat > "${CFG_DIR}/gost.yaml" <<GOSTEOF
 services:
   - name: tommy-client-${TNAME}
@@ -546,6 +639,9 @@ CREATED=$(date '+%Y-%m-%d %H:%M:%S')
 IEOF
     chmod 600 "${CFG_DIR}/tunnel-info.txt"
 
+    # Register in central registry
+    register_tunnel "$TNAME" "gost" "$FWD_PORT" "$PROFILE"
+
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║  Gost TLS Relay Connected!                           ║${NC}"
@@ -601,7 +697,6 @@ connect_hysteria2_tunnel() {
     fi
 
     # Create Hysteria2 client config with TCP port forwarding
-    # listen on 0.0.0.0:FWD_PORT, forward to 127.0.0.1:FWD_PORT on the foreign server
     cat > "${CFG_DIR}/config.yaml" <<HYEOF
 server: ${FOREIGN_IP}:${TUNNEL_PORT}
 auth: ${HY2_PASS}
@@ -664,6 +759,9 @@ CREATED=$(date '+%Y-%m-%d %H:%M:%S')
 IEOF
     chmod 600 "${CFG_DIR}/tunnel-info.txt"
 
+    # Register in central registry
+    register_tunnel "$TNAME" "hysteria2" "$FWD_PORT" "$PROFILE"
+
     echo ""
     echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}║  Hysteria2 Tunnel Connected!                         ║${NC}"
@@ -682,17 +780,127 @@ IEOF
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CONNECT TUNNEL (Main Entry)
+#  CONNECT TUNNEL - using Connection Code (Primary Method)
 # ══════════════════════════════════════════════════════════════════════════════
-connect_tunnel() {
+connect_with_code() {
     echo ""
     info "=========================================="
-    info "  Tommy v${TOMMY_VER} - Connect Port Forwarding Tunnel"
-    info "  (Iranian Server / Client Side)"
+    info "  Tommy v${TOMMY_VER} - Connect via Connection Code"
+    info "  (Recommended - Auto-configures from foreign server)"
+    info "=========================================="
+    echo ""
+    info "Paste the connection code from the foreign server."
+    info "(Found in /root/tommy-<name>-connection-code.txt on the foreign server)"
+    echo ""
+    read -rp "Connection Code: " CONN_CODE
+
+    if [[ -z "$CONN_CODE" ]]; then
+        err "No connection code entered."
+        return
+    fi
+
+    # Parse the code
+    PARSED_METHOD=""
+    PARSED_SERVER_IP=""
+    PARSED_FWD_PORT=""
+    PARSED_PROFILE=""
+    PARSED_EXTRA=""
+
+    if ! parse_connection_code "$CONN_CODE"; then
+        return
+    fi
+
+    # Show parsed info for confirmation
+    echo ""
+    info "Decoded connection code:"
+    info "  Method:     ${PARSED_METHOD}"
+    info "  Server IP:  ${PARSED_SERVER_IP}"
+    info "  Fwd Port:   ${PARSED_FWD_PORT}"
+    info "  Profile:    ${PARSED_PROFILE}"
+    echo ""
+
+    # Step: Tunnel name
+    read -rp "Enter a name for this tunnel (e.g. tunnel1): " TNAME
+    TNAME="${TNAME:-tunnel1}"
+    TNAME=$(echo "$TNAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
+    if [[ -z "$TNAME" ]]; then
+        err "Tunnel name cannot be empty."
+        return
+    fi
+
+    if tunnel_exists "$TNAME"; then
+        err "Tunnel '${TNAME}' already exists. Delete it first or choose another name."
+        return
+    fi
+
+    # Install common deps
+    info "Installing dependencies..."
+    if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
+        apt-get update -y 2>/dev/null || true
+        apt-get install -y curl wget openssl 2>/dev/null || true
+    elif [[ "$OS_ID" == "centos" || "$OS_ID" == "rhel" || "$OS_ID" == "rocky" || "$OS_ID" == "almalinux" ]]; then
+        yum install -y curl wget openssl 2>/dev/null || true
+    fi
+
+    optimize_system
+
+    # Get local IP
+    LOCAL_IP=$(get_local_ip)
+
+    # Set up based on method
+    case "$PARSED_METHOD" in
+        ssh)
+            # Extra: ssh_port:keepalive:private_key_base64
+            local SSH_PORT KEEPALIVE PRIV_KEY_B64
+            SSH_PORT=$(echo "$PARSED_EXTRA" | cut -d':' -f1)
+            KEEPALIVE=$(echo "$PARSED_EXTRA" | cut -d':' -f2)
+            PRIV_KEY_B64=$(echo "$PARSED_EXTRA" | cut -d':' -f3-)
+            connect_ssh_tunnel "$TNAME" "$PARSED_SERVER_IP" "$SSH_PORT" "$PARSED_FWD_PORT" "$PARSED_PROFILE" "$PRIV_KEY_B64"
+            ;;
+        wireguard)
+            # Extra: wg_port:mtu:keepalive:srv_wg_ip:cli_wg_ip:cli_priv:srv_pub
+            local WG_PORT MTU KEEPALIVE SRV_WG_IP CLI_WG_IP CLI_PRIV SRV_PUB
+            WG_PORT=$(echo "$PARSED_EXTRA" | cut -d':' -f1)
+            MTU=$(echo "$PARSED_EXTRA" | cut -d':' -f2)
+            KEEPALIVE=$(echo "$PARSED_EXTRA" | cut -d':' -f3)
+            SRV_WG_IP=$(echo "$PARSED_EXTRA" | cut -d':' -f4)
+            CLI_WG_IP=$(echo "$PARSED_EXTRA" | cut -d':' -f5)
+            CLI_PRIV=$(echo "$PARSED_EXTRA" | cut -d':' -f6)
+            SRV_PUB=$(echo "$PARSED_EXTRA" | cut -d':' -f7)
+            connect_wireguard_tunnel "$TNAME" "$PARSED_SERVER_IP" "$WG_PORT" "$PARSED_FWD_PORT" "$PARSED_PROFILE" "$MTU" "$KEEPALIVE" "$SRV_WG_IP" "$CLI_WG_IP" "$CLI_PRIV" "$SRV_PUB"
+            ;;
+        gost)
+            # Extra: tunnel_port:password
+            local TUNNEL_PORT GOST_PASS
+            TUNNEL_PORT=$(echo "$PARSED_EXTRA" | cut -d':' -f1)
+            GOST_PASS=$(echo "$PARSED_EXTRA" | cut -d':' -f2)
+            connect_gost_tunnel "$TNAME" "$PARSED_SERVER_IP" "$TUNNEL_PORT" "$PARSED_FWD_PORT" "$GOST_PASS" "$PARSED_PROFILE"
+            ;;
+        hysteria2)
+            # Extra: tunnel_port:password
+            local TUNNEL_PORT HY2_PASS
+            TUNNEL_PORT=$(echo "$PARSED_EXTRA" | cut -d':' -f1)
+            HY2_PASS=$(echo "$PARSED_EXTRA" | cut -d':' -f2)
+            connect_hysteria2_tunnel "$TNAME" "$PARSED_SERVER_IP" "$TUNNEL_PORT" "$PARSED_FWD_PORT" "$HY2_PASS" "$PARSED_PROFILE"
+            ;;
+        *)
+            err "Unknown method '${PARSED_METHOD}' in connection code."
+            return
+            ;;
+    esac
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONNECT TUNNEL - Manual Entry (Fallback)
+# ══════════════════════════════════════════════════════════════════════════════
+connect_manual() {
+    echo ""
+    info "=========================================="
+    info "  Tommy v${TOMMY_VER} - Manual Setup"
+    info "  (Enter all settings manually)"
     info "=========================================="
     echo ""
     info "Enter the credentials from the foreign server."
-    info "(Found in /root/tommy-<name>-client-info.txt on the foreign server)"
     echo ""
 
     # Step 1: Tunnel name
@@ -704,8 +912,7 @@ connect_tunnel() {
         return
     fi
 
-    local SVC_NAME="tommy-${TNAME}"
-    if [[ -d "${TOMMY_DIR}/${TNAME}" ]] || [[ -f "/etc/systemd/system/${SVC_NAME}.service" ]]; then
+    if tunnel_exists "$TNAME"; then
         err "Tunnel '${TNAME}' already exists. Delete it first or choose another name."
         return
     fi
@@ -729,8 +936,8 @@ connect_tunnel() {
     fi
 
     # Step 4: Forward port
-    read -rp "Enter forward port (same as foreign server) [443]: " FWD_PORT
-    FWD_PORT="${FWD_PORT:-443}"
+    local FWD_PORT=443
+    read_port "Enter forward port (same as foreign server)" "443" FWD_PORT
 
     # Step 5: Profile
     echo ""
@@ -761,24 +968,50 @@ connect_tunnel() {
 
     optimize_system
 
+    # Get local IP
+    LOCAL_IP=$(get_local_ip)
+
     # Step 7: Method-specific setup
     case "$METHOD_CHOICE" in
         1)
-            # SSH Tunnel
-            read -rp "Enter SSH port on foreign server [22]: " SSH_PORT
-            SSH_PORT="${SSH_PORT:-22}"
-            connect_ssh_tunnel "$TNAME" "$FOREIGN_IP" "$SSH_PORT" "$FWD_PORT" "$PROFILE"
+            local SSH_PORT=22
+            read_port "Enter SSH port on foreign server" "22" SSH_PORT
+            connect_ssh_tunnel "$TNAME" "$FOREIGN_IP" "$SSH_PORT" "$FWD_PORT" "$PROFILE" ""
             ;;
         2)
-            # WireGuard
-            read -rp "Enter WireGuard UDP port on foreign server [51820]: " WG_PORT
-            WG_PORT="${WG_PORT:-51820}"
-            connect_wireguard_tunnel "$TNAME" "$FOREIGN_IP" "$WG_PORT" "$FWD_PORT" "$PROFILE"
+            local WG_PORT=51820
+            read_port "Enter WireGuard UDP port on foreign server" "51820" WG_PORT
+            echo ""
+            info "Paste the WireGuard client config from the foreign server."
+            info "(The [Interface] and [Peer] sections)"
+            info "Press Enter on an empty line when done."
+            echo ""
+            local WG_CONFIG=""
+            while IFS= read -r line; do
+                if [[ -z "$line" ]]; then
+                    break
+                fi
+                WG_CONFIG="${WG_CONFIG}${line}"$'\n'
+            done
+            if [[ -z "$WG_CONFIG" ]]; then
+                err "No WireGuard config provided."
+                return
+            fi
+            # Parse WG config manually
+            local CLI_PRIV="" CLI_WG_IP="" MTU="1280" SRV_PUB="" KEEPALIVE="25" SRV_WG_IP="10.10.0.1"
+            CLI_PRIV=$(echo "$WG_CONFIG" | grep "PrivateKey" | head -1 | awk '{print $3}')
+            CLI_WG_IP=$(echo "$WG_CONFIG" | grep "Address" | head -1 | awk '{print $3}' | cut -d'/' -f1)
+            MTU=$(echo "$WG_CONFIG" | grep "MTU" | head -1 | awk '{print $3}')
+            MTU="${MTU:-1280}"
+            SRV_PUB=$(echo "$WG_CONFIG" | grep "PublicKey" | head -1 | awk '{print $3}')
+            KEEPALIVE=$(echo "$WG_CONFIG" | grep "PersistentKeepalive" | head -1 | awk '{print $3}')
+            KEEPALIVE="${KEEPALIVE:-25}"
+            SRV_WG_IP="10.10.0.1"
+            connect_wireguard_tunnel "$TNAME" "$FOREIGN_IP" "$WG_PORT" "$FWD_PORT" "$PROFILE" "$MTU" "$KEEPALIVE" "$SRV_WG_IP" "$CLI_WG_IP" "$CLI_PRIV" "$SRV_PUB"
             ;;
         3)
-            # Gost
-            read -rp "Enter Gost tunnel port on foreign server [8443]: " TUNNEL_PORT
-            TUNNEL_PORT="${TUNNEL_PORT:-8443}"
+            local TUNNEL_PORT=8443
+            read_port "Enter Gost tunnel port on foreign server" "8443" TUNNEL_PORT
             read -rp "Enter Gost password from foreign server: " GOST_PASS
             if [[ -z "$GOST_PASS" ]]; then
                 err "Gost password is required."
@@ -787,9 +1020,8 @@ connect_tunnel() {
             connect_gost_tunnel "$TNAME" "$FOREIGN_IP" "$TUNNEL_PORT" "$FWD_PORT" "$GOST_PASS" "$PROFILE"
             ;;
         4)
-            # Hysteria2
-            read -rp "Enter Hysteria2 tunnel port on foreign server [8443]: " TUNNEL_PORT
-            TUNNEL_PORT="${TUNNEL_PORT:-8443}"
+            local TUNNEL_PORT=8443
+            read_port "Enter Hysteria2 tunnel port on foreign server" "8443" TUNNEL_PORT
             read -rp "Enter Hysteria2 password from foreign server: " HY2_PASS
             if [[ -z "$HY2_PASS" ]]; then
                 err "Hysteria2 password is required."
@@ -814,31 +1046,25 @@ list_tunnels() {
     info "=========================================="
 
     local FOUND=0
-    for info_file in "${TOMMY_DIR}"/*/tunnel-info.txt; do
-        if [[ ! -f "$info_file" ]]; then
-            continue
-        fi
-        FOUND=1
-        local TNAME="" METHOD="" FOREIGN_IP="" FWD_PORT="" PROFILE="" CREATED="" LOCAL_IP=""
-        # shellcheck disable=SC1090
-        source "$info_file"
-        local SVC_NAME="tommy-${TNAME}"
-        local STATUS="STOPPED"
-        if systemctl is-active --quiet "$SVC_NAME" 2>/dev/null; then
-            STATUS="RUNNING"
-        fi
-        echo ""
-        echo -e "  ${GREEN}Name:${NC}      ${TNAME}"
-        echo -e "  ${GREEN}Method:${NC}    ${METHOD}"
-        echo -e "  ${GREEN}Foreign:${NC}   ${FOREIGN_IP}"
-        echo -e "  ${GREEN}Fwd Port:${NC}  ${FWD_PORT}"
-        echo -e "  ${GREEN}Profile:${NC}   ${PROFILE}"
-        echo -e "  ${GREEN}Local IP:${NC}  ${LOCAL_IP}"
-        echo -e "  ${GREEN}Service:${NC}   ${SVC_NAME}"
-        echo -e "  ${GREEN}Status:${NC}    ${STATUS}"
-        echo -e "  ${GREEN}Created:${NC}   ${CREATED}"
-        echo -e "  ${CYAN}──────────────────────────────────${NC}"
-    done
+    if [[ -f "$TOMMY_REGISTRY" ]]; then
+        while IFS='|' read -r tname method fwd_port profile created; do
+            FOUND=1
+            local SVC_NAME="tommy-${tname}"
+            local STATUS="STOPPED"
+            if systemctl is-active --quiet "$SVC_NAME" 2>/dev/null; then
+                STATUS="RUNNING"
+            fi
+            echo ""
+            echo -e "  ${GREEN}Name:${NC}      ${tname}"
+            echo -e "  ${GREEN}Method:${NC}    ${method}"
+            echo -e "  ${GREEN}Fwd Port:${NC}  ${fwd_port}"
+            echo -e "  ${GREEN}Profile:${NC}   ${profile}"
+            echo -e "  ${GREEN}Service:${NC}   ${SVC_NAME}"
+            echo -e "  ${GREEN}Status:${NC}    ${STATUS}"
+            echo -e "  ${GREEN}Created:${NC}   ${created}"
+            echo -e "  ${CYAN}──────────────────────────────────${NC}"
+        done < "$TOMMY_REGISTRY"
+    fi
 
     if [[ "$FOUND" -eq 0 ]]; then
         warn "No tunnels found. Create one with option 1."
@@ -868,8 +1094,12 @@ delete_tunnel() {
     # Read info before deletion
     local METHOD="" FWD_PORT=""
     if [[ -f "${TUNNEL_DIR}/tunnel-info.txt" ]]; then
-        # shellcheck disable=SC1090
-        source "${TUNNEL_DIR}/tunnel-info.txt"
+        while IFS='=' read -r key value; do
+            case "$key" in
+                METHOD) METHOD="$value" ;;
+                FWD_PORT) FWD_PORT="$value" ;;
+            esac
+        done < "${TUNNEL_DIR}/tunnel-info.txt"
     fi
 
     # Confirm
@@ -892,8 +1122,8 @@ delete_tunnel() {
         systemctl stop "${SVC_NAME}-fwd" 2>/dev/null || true
         systemctl disable "${SVC_NAME}-fwd" 2>/dev/null || true
         rm -f "/etc/systemd/system/${SVC_NAME}-fwd.service"
-        wg-quick down wg0 2>/dev/null || true
-        rm -f /etc/wireguard/wg0.conf 2>/dev/null || true
+        wg-quick down "${TUNNEL_DIR}/wg0.conf" 2>/dev/null || true
+        rm -f "/etc/wireguard/wg0-${DEL_NAME}.conf" 2>/dev/null || true
     fi
 
     systemctl daemon-reload
@@ -905,6 +1135,9 @@ delete_tunnel() {
     if [[ -n "$FWD_PORT" ]]; then
         close_firewall "$FWD_PORT" tcp
     fi
+
+    # Unregister from central registry
+    unregister_tunnel "$DEL_NAME"
 
     info "Tunnel '${DEL_NAME}' has been DELETED."
     echo ""
@@ -940,20 +1173,41 @@ service_manager() {
                 list_tunnels
                 read -rp "Enter tunnel name to START: " SM_NAME
                 SM_NAME=$(echo "$SM_NAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
-                if systemctl start "tommy-${SM_NAME}" 2>/dev/null; then
-                    info "Tunnel '${SM_NAME}' started."
-                else
-                    warn "Failed to start tunnel '${SM_NAME}'."
+                if [[ -z "$SM_NAME" ]]; then
+                    err "No tunnel name entered."
+                    continue
                 fi
-                # Also start WireGuard forwarding if applicable
-                if [[ -f "/etc/systemd/system/tommy-${SM_NAME}-fwd.service" ]]; then
-                    systemctl start "tommy-${SM_NAME}-fwd" 2>/dev/null || true
+                if ! tunnel_exists "$SM_NAME"; then
+                    err "Tunnel '${SM_NAME}' does not exist."
+                    continue
+                fi
+                if systemctl start "tommy-${SM_NAME}" 2>/dev/null; then
+                    # Also start WireGuard forwarding if applicable
+                    if [[ -f "/etc/systemd/system/tommy-${SM_NAME}-fwd.service" ]]; then
+                        systemctl start "tommy-${SM_NAME}-fwd" 2>/dev/null || true
+                    fi
+                    sleep 1
+                    if systemctl is-active --quiet "tommy-${SM_NAME}"; then
+                        info "Tunnel '${SM_NAME}' started and is RUNNING."
+                    else
+                        warn "Tunnel '${SM_NAME}' started but is not running. Check logs."
+                    fi
+                else
+                    err "Failed to start tunnel '${SM_NAME}'."
                 fi
                 ;;
             3)
                 list_tunnels
                 read -rp "Enter tunnel name to STOP: " SM_NAME
                 SM_NAME=$(echo "$SM_NAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
+                if [[ -z "$SM_NAME" ]]; then
+                    err "No tunnel name entered."
+                    continue
+                fi
+                if ! tunnel_exists "$SM_NAME"; then
+                    err "Tunnel '${SM_NAME}' does not exist."
+                    continue
+                fi
                 # Stop forwarding service first if applicable
                 if [[ -f "/etc/systemd/system/tommy-${SM_NAME}-fwd.service" ]]; then
                     systemctl stop "tommy-${SM_NAME}-fwd" 2>/dev/null || true
@@ -968,13 +1222,26 @@ service_manager() {
                 list_tunnels
                 read -rp "Enter tunnel name to RESTART: " SM_NAME
                 SM_NAME=$(echo "$SM_NAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
-                if systemctl restart "tommy-${SM_NAME}" 2>/dev/null; then
-                    info "Tunnel '${SM_NAME}' restarted."
-                else
-                    warn "Failed to restart tunnel '${SM_NAME}'."
+                if [[ -z "$SM_NAME" ]]; then
+                    err "No tunnel name entered."
+                    continue
                 fi
-                if [[ -f "/etc/systemd/system/tommy-${SM_NAME}-fwd.service" ]]; then
-                    systemctl restart "tommy-${SM_NAME}-fwd" 2>/dev/null || true
+                if ! tunnel_exists "$SM_NAME"; then
+                    err "Tunnel '${SM_NAME}' does not exist."
+                    continue
+                fi
+                if systemctl restart "tommy-${SM_NAME}" 2>/dev/null; then
+                    if [[ -f "/etc/systemd/system/tommy-${SM_NAME}-fwd.service" ]]; then
+                        systemctl restart "tommy-${SM_NAME}-fwd" 2>/dev/null || true
+                    fi
+                    sleep 1
+                    if systemctl is-active --quiet "tommy-${SM_NAME}"; then
+                        info "Tunnel '${SM_NAME}' restarted and is RUNNING."
+                    else
+                        warn "Tunnel '${SM_NAME}' restarted but is not running. Check logs."
+                    fi
+                else
+                    err "Failed to restart tunnel '${SM_NAME}'."
                 fi
                 ;;
             5)
@@ -1011,91 +1278,111 @@ service_manager() {
 test_connection() {
     echo ""
     info "=========================================="
-    info "  Testing Tunnel Connection"
+    info "  Tommy v${TOMMY_VER} - Tunnel Connection Test"
     info "=========================================="
     echo ""
+    list_tunnels
 
-    # Find active tunnels
-    local FOUND=0
-    for info_file in "${TOMMY_DIR}"/*/tunnel-info.txt; do
-        if [[ ! -f "$info_file" ]]; then
-            continue
+    read -rp "Enter tunnel name to test: " TEST_NAME
+    TEST_NAME=$(echo "$TEST_NAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
+
+    if ! tunnel_exists "$TEST_NAME"; then
+        err "Tunnel '${TEST_NAME}' does not exist."
+        return
+    fi
+
+    local SVC_NAME="tommy-${TEST_NAME}"
+    local CFG_DIR="${TOMMY_DIR}/${TEST_NAME}"
+
+    # Check service status
+    if systemctl is-active --quiet "$SVC_NAME" 2>/dev/null; then
+        info "Service '${SVC_NAME}' is RUNNING."
+    else
+        warn "Service '${SVC_NAME}' is STOPPED."
+    fi
+
+    # Read tunnel info
+    local METHOD="" FWD_PORT="" FOREIGN_IP=""
+    if [[ -f "${CFG_DIR}/tunnel-info.txt" ]]; then
+        while IFS='=' read -r key value; do
+            case "$key" in
+                METHOD) METHOD="$value" ;;
+                FWD_PORT) FWD_PORT="$value" ;;
+                FOREIGN_IP) FOREIGN_IP="$value" ;;
+            esac
+        done < "${CFG_DIR}/tunnel-info.txt"
+    fi
+
+    # Test port
+    if [[ -n "$FWD_PORT" ]]; then
+        info "Testing port ${FWD_PORT}..."
+        if command -v nc >/dev/null 2>&1; then
+            if nc -z -w 5 localhost "$FWD_PORT" 2>/dev/null; then
+                info "Port ${FWD_PORT} is OPEN and listening."
+            else
+                warn "Port ${FWD_PORT} is NOT listening."
+            fi
+        elif command -v ss >/dev/null 2>&1; then
+            if ss -tlnp | grep -q ":${FWD_PORT} "; then
+                info "Port ${FWD_PORT} is OPEN and listening."
+            else
+                warn "Port ${FWD_PORT} is NOT listening."
+            fi
         fi
-        FOUND=1
-        local TNAME="" METHOD="" FOREIGN_IP="" FWD_PORT=""
-        # shellcheck disable=SC1090
-        source "$info_file"
-        local SVC_NAME="tommy-${TNAME}"
-        if systemctl is-active --quiet "$SVC_NAME" 2>/dev/null; then
-            info "Testing tunnel '${TNAME}' (${METHOD}) on port ${FWD_PORT}..."
+    fi
 
-            # Test if the port is listening
-            if ss -tlnp 2>/dev/null | grep -q ":${FWD_PORT} "; then
-                info "Port ${FWD_PORT} is LISTENING on this server."
-            else
-                warn "Port ${FWD_PORT} is NOT listening. Tunnel may not be working."
-                continue
-            fi
-
-            # Try to connect through the tunnel
-            local TEST_RESULT=""
-            TEST_RESULT=$(timeout 10 bash -c "echo '' | nc -w 5 ${LOCAL_IP} ${FWD_PORT} 2>/dev/null && echo 'PORT_OPEN' || echo 'PORT_CLOSED'" 2>/dev/null)
-            if echo "$TEST_RESULT" | grep -q "PORT_OPEN"; then
-                info "Port ${FWD_PORT} is accepting connections."
-            else
-                warn "Port ${FWD_PORT} is not accepting connections."
-            fi
+    # Test connectivity to foreign server
+    if [[ -n "$FOREIGN_IP" ]]; then
+        info "Testing connectivity to foreign server ${FOREIGN_IP}..."
+        if ping -c 1 -W 3 "$FOREIGN_IP" >/dev/null 2>&1; then
+            info "Foreign server ${FOREIGN_IP} is reachable."
         else
-            warn "Tunnel '${TNAME}' is STOPPED."
+            warn "Foreign server ${FOREIGN_IP} is NOT reachable (may be normal if ICMP is blocked)."
         fi
-    done
-
-    if [[ "$FOUND" -eq 0 ]]; then
-        warn "No tunnels found to test."
     fi
 
     echo ""
-    info "To fully test: make sure 3x-ui is running on the foreign server,"
-    info "then configure External Proxy in 3x-ui with this server's IP and the forward port."
-    echo ""
+    info "Test complete."
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN MENU
 # ══════════════════════════════════════════════════════════════════════════════
-main_menu() {
-    show_banner
-    echo -e "${BOLD}  1)${NC} Connect to Tunnel"
-    echo -e "${BOLD}  2)${NC} Service Manager (Start/Stop/Restart/Delete)"
-    echo -e "${BOLD}  3)${NC} List Tunnels"
-    echo -e "${BOLD}  4)${NC} Delete Tunnel"
-    echo -e "${BOLD}  5)${NC} Test Connection"
-    echo -e "${BOLD}  6)${NC} System Optimization (BBR + Buffers)"
-    echo -e "${BOLD}  0)${NC} Exit"
-    echo ""
-    read -rp "Select [0-6]: " MAIN_CHOICE
+main() {
+    check_root
+    detect_os
 
-    case "$MAIN_CHOICE" in
-        1) connect_tunnel ;;
-        2) service_manager ;;
-        3) list_tunnels ;;
-        4) delete_tunnel ;;
-        5) test_connection ;;
-        6) optimize_system ;;
-        0) exit 0 ;;
-        *) warn "Invalid choice." ;;
-    esac
+    # Ensure base directory exists
+    mkdir -p "${TOMMY_DIR}"
+
+    while true; do
+        show_banner
+        echo -e "${CYAN}╔════════════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║  Tommy v${TOMMY_VER} - Iranian Server            ║${NC}"
+        echo -e "${CYAN}╠════════════════════════════════════════════╣${NC}"
+        echo -e "${CYAN}║  1) Connect via Connection Code (recommended) ║${NC}"
+        echo -e "${CYAN}║  2) Manual Setup                           ║${NC}"
+        echo -e "${CYAN}║  3) List tunnels                           ║${NC}"
+        echo -e "${CYAN}║  4) Delete a tunnel                        ║${NC}"
+        echo -e "${CYAN}║  5) Service Manager                        ║${NC}"
+        echo -e "${CYAN}║  6) Exit                                   ║${NC}"
+        echo -e "${CYAN}╚════════════════════════════════════════════╝${NC}"
+        echo ""
+        read -rp "Select [1-6]: " MAIN_CHOICE
+
+        case "$MAIN_CHOICE" in
+            1) connect_with_code ;;
+            2) connect_manual ;;
+            3) list_tunnels ;;
+            4) delete_tunnel ;;
+            5) service_manager ;;
+            6) info "Goodbye!"; exit 0 ;;
+            *) warn "Invalid choice." ;;
+        esac
+
+        echo ""
+        read -rp "Press Enter to continue..."
+    done
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
-check_root
-detect_os
-LOCAL_IP=$(get_local_ip)
-info "This server IP: ${LOCAL_IP}"
-mkdir -p "${TOMMY_DIR}"
-
-while true; do
-    main_menu
-done
+main
