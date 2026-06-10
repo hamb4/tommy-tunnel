@@ -16,15 +16,18 @@
 #    1. This script sets up a tunnel SERVER on the foreign server
 #    2. Iranian server connects and forwards a port (e.g. 443)
 #    3. In 3x-ui, set External Proxy = Iranian server IP + forwarded port
-#    4. Users in Iran connect to Iranian server → tunnel → foreign 3x-ui → internet
+#    4. Users in Iran connect to Iranian server -> tunnel -> foreign 3x-ui -> internet
 #
 #  Usage:
 #    bash <(curl -Ls https://raw.githubusercontent.com/hamb4/tommy-tunnel/main/tommy-server-setup.sh)
 #===============================================================================
 
+set -euo pipefail
+
 TOMMY_VER="1.0.5"
 TOMMY_AUTHOR="hamb4"
 TOMMY_DIR="/etc/tommy"
+TOMMY_REGISTRY="${TOMMY_DIR}/tunnels.registry"
 
 # Colors
 RED='\033[0;31m'
@@ -49,9 +52,13 @@ check_root() {
 
 get_server_ip() {
     local IP=""
-    IP=$(curl -s4 --connect-timeout 5 https://ifconfig.me 2>/dev/null) \
-        || IP=$(curl -s4 --connect-timeout 5 https://api.ipify.org 2>/dev/null) \
-        || IP=$(curl -s4 --connect-timeout 5 https://ip.sb 2>/dev/null)
+    IP=$(curl -s4 --connect-timeout 5 https://ifconfig.me 2>/dev/null || true)
+    if [[ -z "$IP" ]]; then
+        IP=$(curl -s4 --connect-timeout 5 https://api.ipify.org 2>/dev/null || true)
+    fi
+    if [[ -z "$IP" ]]; then
+        IP=$(curl -s4 --connect-timeout 5 https://ip.sb 2>/dev/null || true)
+    fi
     if [[ -z "$IP" ]]; then
         read -rp "Enter this server's public IP: " IP
     fi
@@ -60,6 +67,57 @@ get_server_ip() {
 
 gen_password() {
     openssl rand -base64 24 | tr -d '/+= ' | head -c 32
+}
+
+# Read port with validation - if empty or non-numeric, use default
+read_port() {
+    local prompt="$1"
+    local default="$2"
+    local var_name="$3"
+    local input=""
+    read -rp "$prompt [$default]: " input
+    # Remove whitespace
+    input=$(echo "$input" | tr -d '[:space:]')
+    # If empty or not a number, use default
+    if [[ -z "$input" ]] || ! [[ "$input" =~ ^[0-9]+$ ]]; then
+        eval "${var_name}=${default}"
+    else
+        eval "${var_name}=${input}"
+    fi
+}
+
+# Register tunnel in central registry
+register_tunnel() {
+    local tname="$1"
+    local method="$2"
+    local fwd_port="$3"
+    local profile="$4"
+    mkdir -p "${TOMMY_DIR}"
+    # Remove old entry for same name
+    if [[ -f "$TOMMY_REGISTRY" ]]; then
+        sed -i "/^${tname}|/d" "$TOMMY_REGISTRY" 2>/dev/null || true
+    fi
+    echo "${tname}|${method}|${fwd_port}|${profile}|$(date '+%Y-%m-%d %H:%M:%S')" >> "$TOMMY_REGISTRY"
+    chmod 600 "$TOMMY_REGISTRY"
+}
+
+# Unregister tunnel from central registry
+unregister_tunnel() {
+    local tname="$1"
+    if [[ -f "$TOMMY_REGISTRY" ]]; then
+        sed -i "/^${tname}|/d" "$TOMMY_REGISTRY" 2>/dev/null || true
+    fi
+}
+
+# Check if a tunnel name exists
+tunnel_exists() {
+    local tname="$1"
+    if [[ -f "$TOMMY_REGISTRY" ]]; then
+        grep -q "^${tname}|" "$TOMMY_REGISTRY" 2>/dev/null && return 0
+    fi
+    [[ -d "${TOMMY_DIR}/${tname}" ]] && return 0
+    [[ -f "/etc/systemd/system/tommy-${tname}.service" ]] && return 0
+    return 1
 }
 
 open_firewall() {
@@ -118,7 +176,7 @@ optimize_system() {
     info "Enabling BBR congestion control..."
     if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
         if ! grep -q "tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null; then
-            cat >> /etc/sysctl.conf <<EOF
+            cat >> /etc/sysctl.conf <<SYSEOF
 # Tommy v${TOMMY_VER} - BBR
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
@@ -131,7 +189,7 @@ net.core.netdev_max_backlog=65536
 net.ipv4.udp_mem=1048576 2097152 4194304
 net.ipv4.ip_forward=1
 net.ipv6.conf.all.forwarding=1
-EOF
+SYSEOF
         fi
         sysctl -p /etc/sysctl.conf 2>/dev/null || true
         info "BBR and buffer optimization enabled."
@@ -154,6 +212,20 @@ show_banner() {
     echo -e "  ${BOLD}Tommy Tunnel v${TOMMY_VER}  |  Author: ${TOMMY_AUTHOR}${NC}"
     echo -e "  ${BLUE}Foreign Server - Port Forwarding Tunnel${NC}"
     echo ""
+}
+
+# ── Generate Connection Code ─────────────────────────────────────────────────
+generate_connection_code() {
+    local method="$1"
+    local server_ip="$2"
+    local fwd_port="$3"
+    local profile="$4"
+    local extra="$5"  # method-specific data (port, password, key, etc.)
+
+    # Build a structured string and base64 encode it
+    # Format: TOMMY105|method|server_ip|fwd_port|profile|extra_data
+    local raw="TOMMY105|${method}|${server_ip}|${fwd_port}|${profile}|${extra}"
+    echo "$raw" | base64 -w 0
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -219,15 +291,13 @@ SSHEOF
 
     # Profile settings
     local KEEPALIVE=30
-    local CIPHERS=""
     if [[ "$PROFILE" == "speed" ]]; then
         KEEPALIVE=15
     elif [[ "$PROFILE" == "security" ]]; then
         KEEPALIVE=60
-        CIPHERS="chacha20-poly1305@openssh.com,aes256-gcm@openssh.com"
     fi
 
-    # Create systemd service (on foreign server, SSH just needs to be running)
+    # Create systemd service
     cat > "/etc/systemd/system/${SVC_NAME}.service" <<SVCEOF
 [Unit]
 Description=Tommy SSH Tunnel - ${TNAME}
@@ -248,65 +318,55 @@ SVCEOF
     systemctl enable "$SVC_NAME" >/dev/null 2>&1
     systemctl start "$SVC_NAME" >/dev/null 2>&1
 
-    # Save tunnel info
+    # Read private key
     local PRIVATE_KEY
     PRIVATE_KEY=$(cat "${CFG_DIR}/id_tommy")
 
+    # Save tunnel info
     cat > "${CFG_DIR}/tunnel-info.txt" <<IEOF
 TUNNEL_NAME=${TNAME}
 METHOD=ssh
 FWD_PORT=${FWD_PORT}
 PROFILE=${PROFILE}
 SSH_PORT=${SSH_PORT}
+KEEPALIVE=${KEEPALIVE}
 SERVER_IP=${SERVER_IP}
 CREATED=$(date '+%Y-%m-%d %H:%M:%S')
 IEOF
     chmod 600 "${CFG_DIR}/tunnel-info.txt"
 
-    # Create client info for Iranian server
-    cat > "/root/tommy-${TNAME}-client-info.txt" <<CEOF
-================================================================
-  Tommy v${TOMMY_VER} - SSH Tunnel - Client Info
-  Give this information to the Iranian server admin.
-================================================================
-  Tunnel Method:   SSH Tunnel
-  Server IP:       ${SERVER_IP}
-  SSH Port:        ${SSH_PORT}
-  Forward Port:    ${FWD_PORT}
-  Username:        tommy-tunnel
-  Profile:         ${PROFILE}
+    # Register in central registry
+    register_tunnel "$TNAME" "ssh" "$FWD_PORT" "$PROFILE"
 
-  --- Private Key (copy to Iranian server) ---
-${PRIVATE_KEY}
-================================================================
-  On the Iranian server:
-  1. Run tommy-client-iran.sh
-  2. Choose SSH Tunnel
-  3. Enter the above information
-  4. In 3x-ui External Proxy: set Iranian IP + port ${FWD_PORT}
-================================================================
-CEOF
-    chmod 600 "/root/tommy-${TNAME}-client-info.txt"
+    # Generate connection code
+    # Extra format for SSH: ssh_port:keepalive:private_key_base64
+    local PRIV_KEY_B64
+    PRIV_KEY_B64=$(echo "$PRIVATE_KEY" | base64 -w 0)
+    local EXTRA="${SSH_PORT}:${KEEPALIVE}:${PRIV_KEY_B64}"
+    local CONN_CODE
+    CONN_CODE=$(generate_connection_code "ssh" "${SERVER_IP}" "${FWD_PORT}" "${PROFILE}" "${EXTRA}")
 
-    # Display
+    # Display results
     echo ""
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  SSH Tunnel Created!                                 ║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║  SSH Tunnel Created!                                        ║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║  Server IP:    ${YELLOW}${SERVER_IP}${NC}"
     echo -e "${CYAN}║  SSH Port:     ${YELLOW}${SSH_PORT}${NC}"
     echo -e "${CYAN}║  Forward Port: ${YELLOW}${FWD_PORT}${NC}"
     echo -e "${CYAN}║  Username:     ${YELLOW}tommy-tunnel${NC}"
     echo -e "${CYAN}║  Profile:      ${YELLOW}${PROFILE}${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  Private Key saved to:                               ║${NC}"
-    echo -e "${CYAN}║  /root/tommy-${TNAME}-client-info.txt${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  In 3x-ui External Proxy:                           ║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║  ${BOLD}Connection Code (give to Iranian server):${NC}"
+    echo -e "${YELLOW}  ${CONN_CODE}${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║  In 3x-ui External Proxy:                                  ║${NC}"
     echo -e "${CYAN}║  Set Iranian server IP + port ${FWD_PORT}${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    info "Client info saved to /root/tommy-${TNAME}-client-info.txt"
+    info "Connection code has been saved to /root/tommy-${TNAME}-connection-code.txt"
+    echo "$CONN_CODE" > "/root/tommy-${TNAME}-connection-code.txt"
+    chmod 600 "/root/tommy-${TNAME}-connection-code.txt"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -323,7 +383,7 @@ setup_wireguard_tunnel() {
 
     # Install WireGuard
     if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
-        apt-get update -y
+        apt-get update -y 2>/dev/null || true
         apt-get install -y wireguard wireguard-tools 2>/dev/null || true
     elif [[ "$OS_ID" == "centos" || "$OS_ID" == "rhel" || "$OS_ID" == "rocky" || "$OS_ID" == "almalinux" ]]; then
         yum install -y epel-release 2>/dev/null || true
@@ -351,10 +411,9 @@ setup_wireguard_tunnel() {
     CLI_PRIV=$(cat "${CFG_DIR}/client_privatekey")
     CLI_PUB=$(cat "${CFG_DIR}/client_publickey")
 
-    # Choose WireGuard port
+    # WireGuard port
     local WG_PORT=51820
-    read -rp "Enter WireGuard UDP port [51820]: " WG_PORT_INPUT
-    WG_PORT="${WG_PORT_INPUT:-51820}"
+    read_port "Enter WireGuard UDP port" "51820" WG_PORT
 
     # WireGuard internal IPs
     local SRV_WG_IP="10.10.0.1"
@@ -388,7 +447,7 @@ WGEOF
     chmod 600 "${CFG_DIR}/wg0.conf"
 
     # Copy to WireGuard directory
-    cp "${CFG_DIR}/wg0.conf" /etc/wireguard/wg0.conf 2>/dev/null
+    cp "${CFG_DIR}/wg0.conf" "/etc/wireguard/wg0-${TNAME}.conf" 2>/dev/null || true
 
     # Create systemd service
     cat > "/etc/systemd/system/${SVC_NAME}.service" <<SVCEOF
@@ -398,10 +457,10 @@ After=network.target
 Wants=network.target
 
 [Service]
-Type=notify
+Type=oneshot
+RemainAfterExit=yes
 ExecStart=/usr/bin/wg-quick up ${CFG_DIR}/wg0.conf
 ExecStop=/usr/bin/wg-quick down ${CFG_DIR}/wg0.conf
-RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
@@ -422,66 +481,42 @@ WG_PORT=${WG_PORT}
 PROFILE=${PROFILE}
 SRV_WG_IP=${SRV_WG_IP}
 CLI_WG_IP=${CLI_WG_IP}
+MTU=${MTU}
+KEEPALIVE=${KEEPALIVE}
 SERVER_IP=${SERVER_IP}
 CREATED=$(date '+%Y-%m-%d %H:%M:%S')
 IEOF
     chmod 600 "${CFG_DIR}/tunnel-info.txt"
 
-    # Create client config for Iranian server
-    cat > "/root/tommy-${TNAME}-client-info.txt" <<CEOF
-================================================================
-  Tommy v${TOMMY_VER} - WireGuard Tunnel - Client Info
-  Give this information to the Iranian server admin.
-================================================================
-  Tunnel Method:   WireGuard
-  Server IP:       ${SERVER_IP}
-  WireGuard Port:  ${WG_PORT} (UDP)
-  Forward Port:    ${FWD_PORT}
-  Server WG IP:    ${SRV_WG_IP}
-  Client WG IP:    ${CLI_WG_IP}
-  MTU:             ${MTU}
-  Profile:         ${PROFILE}
+    # Register in central registry
+    register_tunnel "$TNAME" "wireguard" "$FWD_PORT" "$PROFILE"
 
-  --- Client Config (copy to Iranian server) ---
-[Interface]
-PrivateKey = ${CLI_PRIV}
-Address = ${CLI_WG_IP}/24
-MTU = ${MTU}
-DNS = 1.1.1.1
-
-[Peer]
-PublicKey = ${SRV_PUB}
-Endpoint = ${SERVER_IP}:${WG_PORT}
-AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = ${KEEPALIVE}
-================================================================
-  On the Iranian server:
-  1. Run tommy-client-iran.sh
-  2. Choose WireGuard
-  3. Paste the client config above
-  4. In 3x-ui External Proxy: set Iranian IP + port ${FWD_PORT}
-================================================================
-CEOF
-    chmod 600 "/root/tommy-${TNAME}-client-info.txt"
+    # Generate connection code
+    # Extra: wg_port:mtu:keepalive:srv_wg_ip:cli_wg_ip:cli_priv:srv_pub
+    local EXTRA="${WG_PORT}:${MTU}:${KEEPALIVE}:${SRV_WG_IP}:${CLI_WG_IP}:${CLI_PRIV}:${SRV_PUB}"
+    local CONN_CODE
+    CONN_CODE=$(generate_connection_code "wireguard" "${SERVER_IP}" "${FWD_PORT}" "${PROFILE}" "${EXTRA}")
 
     echo ""
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WireGuard Tunnel Created!                           ║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║  WireGuard Tunnel Created!                                  ║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║  Server IP:    ${YELLOW}${SERVER_IP}${NC}"
     echo -e "${CYAN}║  WG Port:      ${YELLOW}${WG_PORT} (UDP)${NC}"
     echo -e "${CYAN}║  Forward Port: ${YELLOW}${FWD_PORT}${NC}"
     echo -e "${CYAN}║  MTU:          ${YELLOW}${MTU}${NC}"
     echo -e "${CYAN}║  Profile:      ${YELLOW}${PROFILE}${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  Client config saved to:                             ║${NC}"
-    echo -e "${CYAN}║  /root/tommy-${TNAME}-client-info.txt${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  In 3x-ui External Proxy:                           ║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║  ${BOLD}Connection Code (give to Iranian server):${NC}"
+    echo -e "${YELLOW}  ${CONN_CODE}${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║  In 3x-ui External Proxy:                                  ║${NC}"
     echo -e "${CYAN}║  Set Iranian server IP + port ${FWD_PORT}${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    info "Client info saved to /root/tommy-${TNAME}-client-info.txt"
+    info "Connection code has been saved to /root/tommy-${TNAME}-connection-code.txt"
+    echo "$CONN_CODE" > "/root/tommy-${TNAME}-connection-code.txt"
+    chmod 600 "/root/tommy-${TNAME}-connection-code.txt"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -517,7 +552,6 @@ setup_gost_tunnel() {
             chmod +x "$GOST_BIN"
             rm -f /tmp/gost.tar.gz /tmp/gost
         fi
-        # Fallback: try go install
         if [[ ! -x "$GOST_BIN" ]]; then
             if command -v go >/dev/null 2>&1; then
                 go install github.com/go-gost/gost/cmd/gost@latest 2>/dev/null || true
@@ -530,7 +564,7 @@ setup_gost_tunnel() {
         err "Gost installation failed. Cannot continue."
         return 1
     fi
-    info "Gost installed: $(gost -V 2>/dev/null || echo 'v3')"
+    info "Gost installed successfully."
 
     # Generate password
     local GOST_PASS
@@ -538,16 +572,7 @@ setup_gost_tunnel() {
 
     # Choose tunnel port (different from forward port)
     local TUNNEL_PORT=8443
-    read -rp "Enter Gost tunnel port (for encrypted relay) [8443]: " TPORT_INPUT
-    TUNNEL_PORT="${TPORT_INPUT:-8443}"
-
-    # Profile settings
-    local GOST_PROTO="relay+tls"
-    if [[ "$PROFILE" == "speed" ]]; then
-        GOST_PROTO="relay+tls"
-    elif [[ "$PROFILE" == "security" ]]; then
-        GOST_PROTO="relay+tls"
-    fi
+    read_port "Enter Gost tunnel port (for encrypted relay)" "8443" TUNNEL_PORT
 
     # Generate self-signed cert for Gost TLS
     openssl req -new -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
@@ -616,49 +641,34 @@ CREATED=$(date '+%Y-%m-%d %H:%M:%S')
 IEOF
     chmod 600 "${CFG_DIR}/tunnel-info.txt"
 
-    # Create client info
-    cat > "/root/tommy-${TNAME}-client-info.txt" <<CEOF
-================================================================
-  Tommy v${TOMMY_VER} - Gost TLS Relay - Client Info
-  Give this information to the Iranian server admin.
-================================================================
-  Tunnel Method:   Gost TLS Relay
-  Server IP:       ${SERVER_IP}
-  Tunnel Port:     ${TUNNEL_PORT} (encrypted TLS relay)
-  Forward Port:    ${FWD_PORT} (port that 3x-ui listens on)
-  Password:        ${GOST_PASS}
-  Profile:         ${PROFILE}
+    # Register in central registry
+    register_tunnel "$TNAME" "gost" "$FWD_PORT" "$PROFILE"
 
-  --- How to use on Iranian server ---
-  Run tommy-client-iran.sh, choose Gost, enter:
-    - Foreign IP:     ${SERVER_IP}
-    - Tunnel Port:    ${TUNNEL_PORT}
-    - Forward Port:   ${FWD_PORT}
-    - Password:       ${GOST_PASS}
-================================================================
-  In 3x-ui External Proxy:
-  Set Iranian server IP + port ${FWD_PORT}
-================================================================
-CEOF
-    chmod 600 "/root/tommy-${TNAME}-client-info.txt"
+    # Generate connection code
+    local EXTRA="${TUNNEL_PORT}:${GOST_PASS}"
+    local CONN_CODE
+    CONN_CODE=$(generate_connection_code "gost" "${SERVER_IP}" "${FWD_PORT}" "${PROFILE}" "${EXTRA}")
 
     echo ""
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  Gost TLS Relay Tunnel Created!                      ║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║  Gost TLS Relay Tunnel Created!                             ║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║  Server IP:    ${YELLOW}${SERVER_IP}${NC}"
     echo -e "${CYAN}║  Tunnel Port:  ${YELLOW}${TUNNEL_PORT} (TLS)${NC}"
     echo -e "${CYAN}║  Forward Port: ${YELLOW}${FWD_PORT}${NC}"
     echo -e "${CYAN}║  Password:     ${YELLOW}${GOST_PASS}${NC}"
     echo -e "${CYAN}║  Profile:      ${YELLOW}${PROFILE}${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  Client info saved to:                               ║${NC}"
-    echo -e "${CYAN}║  /root/tommy-${TNAME}-client-info.txt${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  In 3x-ui External Proxy:                           ║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║  ${BOLD}Connection Code (give to Iranian server):${NC}"
+    echo -e "${YELLOW}  ${CONN_CODE}${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║  In 3x-ui External Proxy:                                  ║${NC}"
     echo -e "${CYAN}║  Set Iranian server IP + port ${FWD_PORT}${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
+    info "Connection code has been saved to /root/tommy-${TNAME}-connection-code.txt"
+    echo "$CONN_CODE" > "/root/tommy-${TNAME}-connection-code.txt"
+    chmod 600 "/root/tommy-${TNAME}-connection-code.txt"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -686,7 +696,7 @@ setup_hysteria2_tunnel() {
         err "Hysteria2 installation failed."
         return 1
     fi
-    info "Hysteria2 installed: $(hysteria version 2>/dev/null || echo 'installed')"
+    info "Hysteria2 installed successfully."
 
     # Generate password
     local HY2_PASS
@@ -694,8 +704,7 @@ setup_hysteria2_tunnel() {
 
     # Choose tunnel port
     local TUNNEL_PORT=8443
-    read -rp "Enter Hysteria2 tunnel port (UDP) [8443]: " TPORT_INPUT
-    TUNNEL_PORT="${TPORT_INPUT:-8443}"
+    read_port "Enter Hysteria2 tunnel port (UDP)" "8443" TUNNEL_PORT
 
     # Generate self-signed cert
     openssl req -new -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
@@ -780,49 +789,34 @@ CREATED=$(date '+%Y-%m-%d %H:%M:%S')
 IEOF
     chmod 600 "${CFG_DIR}/tunnel-info.txt"
 
-    # Create client info
-    cat > "/root/tommy-${TNAME}-client-info.txt" <<CEOF
-================================================================
-  Tommy v${TOMMY_VER} - Hysteria2 Tunnel - Client Info
-  Give this information to the Iranian server admin.
-================================================================
-  Tunnel Method:   Hysteria2
-  Server IP:       ${SERVER_IP}
-  Tunnel Port:     ${TUNNEL_PORT} (UDP - QUIC)
-  Forward Port:    ${FWD_PORT} (port that 3x-ui listens on)
-  Password:        ${HY2_PASS}
-  Profile:         ${PROFILE}
+    # Register in central registry
+    register_tunnel "$TNAME" "hysteria2" "$FWD_PORT" "$PROFILE"
 
-  --- How to use on Iranian server ---
-  Run tommy-client-iran.sh, choose Hysteria2, enter:
-    - Foreign IP:     ${SERVER_IP}
-    - Tunnel Port:    ${TUNNEL_PORT}
-    - Forward Port:   ${FWD_PORT}
-    - Password:       ${HY2_PASS}
-================================================================
-  In 3x-ui External Proxy:
-  Set Iranian server IP + port ${FWD_PORT}
-================================================================
-CEOF
-    chmod 600 "/root/tommy-${TNAME}-client-info.txt"
+    # Generate connection code
+    local EXTRA="${TUNNEL_PORT}:${HY2_PASS}"
+    local CONN_CODE
+    CONN_CODE=$(generate_connection_code "hysteria2" "${SERVER_IP}" "${FWD_PORT}" "${PROFILE}" "${EXTRA}")
 
     echo ""
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  Hysteria2 Tunnel Created!                           ║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║  Hysteria2 Tunnel Created!                                  ║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
     echo -e "${CYAN}║  Server IP:    ${YELLOW}${SERVER_IP}${NC}"
     echo -e "${CYAN}║  Tunnel Port:  ${YELLOW}${TUNNEL_PORT} (UDP)${NC}"
     echo -e "${CYAN}║  Forward Port: ${YELLOW}${FWD_PORT}${NC}"
     echo -e "${CYAN}║  Password:     ${YELLOW}${HY2_PASS}${NC}"
     echo -e "${CYAN}║  Profile:      ${YELLOW}${PROFILE}${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  Client info saved to:                               ║${NC}"
-    echo -e "${CYAN}║  /root/tommy-${TNAME}-client-info.txt${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  In 3x-ui External Proxy:                           ║${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║  ${BOLD}Connection Code (give to Iranian server):${NC}"
+    echo -e "${YELLOW}  ${CONN_CODE}${NC}"
+    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}║  In 3x-ui External Proxy:                                  ║${NC}"
     echo -e "${CYAN}║  Set Iranian server IP + port ${FWD_PORT}${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
     echo ""
+    info "Connection code has been saved to /root/tommy-${TNAME}-connection-code.txt"
+    echo "$CONN_CODE" > "/root/tommy-${TNAME}-connection-code.txt"
+    chmod 600 "/root/tommy-${TNAME}-connection-code.txt"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -845,8 +839,7 @@ create_tunnel() {
     fi
 
     # Check if tunnel already exists
-    local SVC_NAME="tommy-${TNAME}"
-    if [[ -d "${TOMMY_DIR}/${TNAME}" ]] || [[ -f "/etc/systemd/system/${SVC_NAME}.service" ]]; then
+    if tunnel_exists "$TNAME"; then
         err "Tunnel '${TNAME}' already exists. Delete it first or choose another name."
         return
     fi
@@ -866,8 +859,8 @@ create_tunnel() {
     echo ""
     info "The Forward Port is the port that 3x-ui listens on."
     info "Users on the Iranian server will connect to this same port."
-    read -rp "Enter forward port (same as 3x-ui port) [443]: " FWD_PORT
-    FWD_PORT="${FWD_PORT:-443}"
+    local FWD_PORT=443
+    read_port "Enter forward port (same as 3x-ui port)" "443" FWD_PORT
 
     # Step 4: Profile
     echo ""
@@ -898,7 +891,10 @@ create_tunnel() {
 
     optimize_system
 
-    # Step 6: Set up based on method
+    # Step 6: Get server IP
+    SERVER_IP=$(get_server_ip)
+
+    # Step 7: Set up based on method
     case "$METHOD_CHOICE" in
         1) setup_ssh_tunnel "$TNAME" "$FWD_PORT" "$PROFILE" ;;
         2) setup_wireguard_tunnel "$TNAME" "$FWD_PORT" "$PROFILE" ;;
@@ -918,30 +914,25 @@ list_tunnels() {
     info "=========================================="
 
     local FOUND=0
-    for info_file in "${TOMMY_DIR}"/*/tunnel-info.txt; do
-        if [[ ! -f "$info_file" ]]; then
-            continue
-        fi
-        FOUND=1
-        # Read tunnel info
-        local TNAME="" METHOD="" FWD_PORT="" PROFILE="" CREATED="" TPORT="" SERVER_IP=""
-        # shellcheck disable=SC1090
-        source "$info_file"
-        local SVC_NAME="tommy-${TNAME}"
-        local STATUS="STOPPED"
-        if systemctl is-active --quiet "$SVC_NAME" 2>/dev/null; then
-            STATUS="RUNNING"
-        fi
-        echo ""
-        echo -e "  ${GREEN}Name:${NC}      ${TNAME}"
-        echo -e "  ${GREEN}Method:${NC}    ${METHOD}"
-        echo -e "  ${GREEN}Fwd Port:${NC}  ${FWD_PORT}"
-        echo -e "  ${GREEN}Profile:${NC}   ${PROFILE}"
-        echo -e "  ${GREEN}Service:${NC}   ${SVC_NAME}"
-        echo -e "  ${GREEN}Status:${NC}    ${STATUS}"
-        echo -e "  ${GREEN}Created:${NC}   ${CREATED}"
-        echo -e "  ${CYAN}──────────────────────────────────${NC}"
-    done
+    if [[ -f "$TOMMY_REGISTRY" ]]; then
+        while IFS='|' read -r tname method fwd_port profile created; do
+            FOUND=1
+            local SVC_NAME="tommy-${tname}"
+            local STATUS="STOPPED"
+            if systemctl is-active --quiet "$SVC_NAME" 2>/dev/null; then
+                STATUS="RUNNING"
+            fi
+            echo ""
+            echo -e "  ${GREEN}Name:${NC}      ${tname}"
+            echo -e "  ${GREEN}Method:${NC}    ${method}"
+            echo -e "  ${GREEN}Fwd Port:${NC}  ${fwd_port}"
+            echo -e "  ${GREEN}Profile:${NC}   ${profile}"
+            echo -e "  ${GREEN}Service:${NC}   ${SVC_NAME}"
+            echo -e "  ${GREEN}Status:${NC}    ${STATUS}"
+            echo -e "  ${GREEN}Created:${NC}   ${created}"
+            echo -e "  ${CYAN}──────────────────────────────────${NC}"
+        done < "$TOMMY_REGISTRY"
+    fi
 
     if [[ "$FOUND" -eq 0 ]]; then
         warn "No tunnels found. Create one with option 1."
@@ -971,8 +962,15 @@ delete_tunnel() {
     # Read info before deletion
     local METHOD="" FWD_PORT="" WG_PORT="" TUNNEL_PORT=""
     if [[ -f "${TUNNEL_DIR}/tunnel-info.txt" ]]; then
-        # shellcheck disable=SC1090
-        source "${TUNNEL_DIR}/tunnel-info.txt"
+        # Read key-value pairs safely
+        while IFS='=' read -r key value; do
+            case "$key" in
+                METHOD) METHOD="$value" ;;
+                FWD_PORT) FWD_PORT="$value" ;;
+                WG_PORT) WG_PORT="$value" ;;
+                TUNNEL_PORT) TUNNEL_PORT="$value" ;;
+            esac
+        done < "${TUNNEL_DIR}/tunnel-info.txt"
     fi
 
     # Confirm
@@ -993,27 +991,32 @@ delete_tunnel() {
 
     # For WireGuard, also bring down the interface
     if [[ "$METHOD" == "wireguard" ]]; then
-        wg-quick down wg0 2>/dev/null || true
-        rm -f /etc/wireguard/wg0.conf 2>/dev/null || true
+        wg-quick down "${TUNNEL_DIR}/wg0.conf" 2>/dev/null || true
+        rm -f "/etc/wireguard/wg0-${DEL_NAME}.conf" 2>/dev/null || true
     fi
 
     # Remove tunnel config directory
     rm -rf "$TUNNEL_DIR"
 
-    # Remove client info file
-    rm -f "/root/tommy-${DEL_NAME}-client-info.txt"
+    # Remove connection code file
+    rm -f "/root/tommy-${DEL_NAME}-connection-code.txt"
 
     # Close firewall ports
-    close_firewall "$FWD_PORT" tcp
+    if [[ -n "$FWD_PORT" ]]; then
+        close_firewall "$FWD_PORT" tcp
+    fi
     if [[ -n "$TUNNEL_PORT" ]]; then
         if [[ "$METHOD" == "wireguard" ]]; then
-            close_firewall "$WG_PORT" udp
+            close_firewall "${WG_PORT}" udp
         elif [[ "$METHOD" == "hysteria2" ]]; then
             close_firewall "$TUNNEL_PORT" udp
         else
             close_firewall "$TUNNEL_PORT" tcp
         fi
     fi
+
+    # Unregister from central registry
+    unregister_tunnel "$DEL_NAME"
 
     info "Tunnel '${DEL_NAME}' has been DELETED."
     echo ""
@@ -1035,7 +1038,7 @@ service_manager() {
         echo -e "${CYAN}║  5) View tunnel status               ║${NC}"
         echo -e "${CYAN}║  6) View tunnel logs                 ║${NC}"
         echo -e "${CYAN}║  7) Delete a tunnel                  ║${NC}"
-        echo -e "${CYAN}║  8) Show client info                 ║${NC}"
+        echo -e "${CYAN}║  8) Show connection code             ║${NC}"
         echo -e "${CYAN}║  9) Back to main menu                ║${NC}"
         echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
         echo ""
@@ -1049,16 +1052,37 @@ service_manager() {
                 list_tunnels
                 read -rp "Enter tunnel name to START: " SM_NAME
                 SM_NAME=$(echo "$SM_NAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
+                if [[ -z "$SM_NAME" ]]; then
+                    err "No tunnel name entered."
+                    continue
+                fi
+                if ! tunnel_exists "$SM_NAME"; then
+                    err "Tunnel '${SM_NAME}' does not exist."
+                    continue
+                fi
                 if systemctl start "tommy-${SM_NAME}" 2>/dev/null; then
-                    info "Tunnel '${SM_NAME}' started."
+                    sleep 1
+                    if systemctl is-active --quiet "tommy-${SM_NAME}"; then
+                        info "Tunnel '${SM_NAME}' started and is RUNNING."
+                    else
+                        warn "Tunnel '${SM_NAME}' started but is not running. Check logs."
+                    fi
                 else
-                    warn "Failed to start tunnel '${SM_NAME}'."
+                    err "Failed to start tunnel '${SM_NAME}'."
                 fi
                 ;;
             3)
                 list_tunnels
                 read -rp "Enter tunnel name to STOP: " SM_NAME
                 SM_NAME=$(echo "$SM_NAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
+                if [[ -z "$SM_NAME" ]]; then
+                    err "No tunnel name entered."
+                    continue
+                fi
+                if ! tunnel_exists "$SM_NAME"; then
+                    err "Tunnel '${SM_NAME}' does not exist."
+                    continue
+                fi
                 if systemctl stop "tommy-${SM_NAME}" 2>/dev/null; then
                     info "Tunnel '${SM_NAME}' stopped."
                 else
@@ -1069,10 +1093,23 @@ service_manager() {
                 list_tunnels
                 read -rp "Enter tunnel name to RESTART: " SM_NAME
                 SM_NAME=$(echo "$SM_NAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
+                if [[ -z "$SM_NAME" ]]; then
+                    err "No tunnel name entered."
+                    continue
+                fi
+                if ! tunnel_exists "$SM_NAME"; then
+                    err "Tunnel '${SM_NAME}' does not exist."
+                    continue
+                fi
                 if systemctl restart "tommy-${SM_NAME}" 2>/dev/null; then
-                    info "Tunnel '${SM_NAME}' restarted."
+                    sleep 1
+                    if systemctl is-active --quiet "tommy-${SM_NAME}"; then
+                        info "Tunnel '${SM_NAME}' restarted and is RUNNING."
+                    else
+                        warn "Tunnel '${SM_NAME}' restarted but is not running. Check logs."
+                    fi
                 else
-                    warn "Failed to restart tunnel '${SM_NAME}'."
+                    err "Failed to restart tunnel '${SM_NAME}'."
                 fi
                 ;;
             5)
@@ -1092,13 +1129,16 @@ service_manager() {
                 ;;
             8)
                 list_tunnels
-                read -rp "Enter tunnel name to show client info: " SM_NAME
+                read -rp "Enter tunnel name to show connection code: " SM_NAME
                 SM_NAME=$(echo "$SM_NAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
-                if [[ -f "/root/tommy-${SM_NAME}-client-info.txt" ]]; then
+                local CODE_FILE="/root/tommy-${SM_NAME}-connection-code.txt"
+                if [[ -f "$CODE_FILE" ]]; then
                     echo ""
-                    cat "/root/tommy-${SM_NAME}-client-info.txt"
+                    echo -e "${YELLOW}Connection Code for '${SM_NAME}':${NC}"
+                    cat "$CODE_FILE"
+                    echo ""
                 else
-                    warn "Client info not found for '${SM_NAME}'."
+                    warn "Connection code file not found for '${SM_NAME}'."
                 fi
                 ;;
             9)
@@ -1114,37 +1154,39 @@ service_manager() {
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN MENU
 # ══════════════════════════════════════════════════════════════════════════════
-main_menu() {
-    show_banner
-    echo -e "${BOLD}  1)${NC} Create New Tunnel"
-    echo -e "${BOLD}  2)${NC} Service Manager (Start/Stop/Restart/Delete)"
-    echo -e "${BOLD}  3)${NC} List Tunnels"
-    echo -e "${BOLD}  4)${NC} Delete Tunnel"
-    echo -e "${BOLD}  5)${NC} System Optimization (BBR + Buffers)"
-    echo -e "${BOLD}  0)${NC} Exit"
-    echo ""
-    read -rp "Select [0-5]: " MAIN_CHOICE
+main() {
+    check_root
+    detect_os
 
-    case "$MAIN_CHOICE" in
-        1) create_tunnel ;;
-        2) service_manager ;;
-        3) list_tunnels ;;
-        4) delete_tunnel ;;
-        5) optimize_system ;;
-        0) exit 0 ;;
-        *) warn "Invalid choice." ;;
-    esac
+    # Ensure base directory exists
+    mkdir -p "${TOMMY_DIR}"
+
+    while true; do
+        show_banner
+        echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
+        echo -e "${CYAN}║  Tommy v${TOMMY_VER} - Foreign Server       ║${NC}"
+        echo -e "${CYAN}╠══════════════════════════════════════╣${NC}"
+        echo -e "${CYAN}║  1) Create a new tunnel              ║${NC}"
+        echo -e "${CYAN}║  2) List tunnels                     ║${NC}"
+        echo -e "${CYAN}║  3) Delete a tunnel                  ║${NC}"
+        echo -e "${CYAN}║  4) Service Manager                  ║${NC}"
+        echo -e "${CYAN}║  5) Exit                             ║${NC}"
+        echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
+        echo ""
+        read -rp "Select [1-5]: " MAIN_CHOICE
+
+        case "$MAIN_CHOICE" in
+            1) create_tunnel ;;
+            2) list_tunnels ;;
+            3) delete_tunnel ;;
+            4) service_manager ;;
+            5) info "Goodbye!"; exit 0 ;;
+            *) warn "Invalid choice." ;;
+        esac
+
+        echo ""
+        read -rp "Press Enter to continue..."
+    done
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
-check_root
-detect_os
-SERVER_IP=$(get_server_ip)
-info "Server IP: ${SERVER_IP}"
-mkdir -p "${TOMMY_DIR}"
-
-while true; do
-    main_menu
-done
+main
