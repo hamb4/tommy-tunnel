@@ -45,9 +45,8 @@ Tommy has integrated port forwarding **into every protocol**. After setting up e
 ### Step 1: Foreign server
 
 ```bash
-# Upload and run on the foreign server
-chmod +x tommy-server-setup.sh
-sudo ./tommy-server-setup.sh
+# run in the foreign server
+bash <(curl -Ls https://raw.githubusercontent.com/hamb4/tommy-tunnel/main/tommy-server-setup.sh)
 ```
 
 Select protocols (suggested: `1 2 3`). The script prints the connection links and saves the information in `/root/*-client-info.txt`.
@@ -55,9 +54,8 @@ Select protocols (suggested: `1 2 3`). The script prints the connection links an
 ### Step 2: Iran Server
 
 ```bash
-# Upload and run on Iranian server
-chmod +x tommy-client-iran.sh
-sudo ./tommy-client-iran.sh
+# run in Iranian server
+cbash <(curl -LS https://raw.githubusercontent.com/hamb4/tommy-tunnel/main/tommy-client-iran.sh)
 ```
 
 Select the same protocol, enter the connection information from step 1. Script:
