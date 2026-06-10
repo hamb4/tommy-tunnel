@@ -76,7 +76,7 @@ In the 3x-ui panel On the external server:
 ## Tunnel Methods
 
 | Method | Protocol | Encryption | Speed ​​| DPI Resistance | Best for |
-|------|--------|-----|------------|------------|
+|------|--------|-----|------------|------------|-----------|
 | SSH Tunnel | TCP | Yes (ED25519) | Good | Low | Easy and secure setup |
 | WireGuard | UDP | Yes (ChaCha20) | Very fast | Medium | Maximum speed |
 | Gost TLS Relay | TCP | Yes (TLS) | Good | High | Similar to HTTPS traffic |
