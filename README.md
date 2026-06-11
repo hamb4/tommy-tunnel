@@ -36,6 +36,18 @@ User in Iran → Iran server (Tommy client) → Tunnel → Foreign server (Tommy
 - **No x-ray required**: Pure port forwarding — works with External Proxy in 3x-ui
 ---
 
+## Prerequisite
+To tunnel Gost, first install it into the Iranian server using the following command, then create a tunnel through Gost.
+```bash 
+bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh) --install
+```
+## Hysterya2
+```bash
+bash <(curl -fsSL https://get.hy2.sh/)
+```
+
+---
+
 ## Quick Guide
 
 ### Step 1: External Server
