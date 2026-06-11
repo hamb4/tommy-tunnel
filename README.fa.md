@@ -39,16 +39,18 @@
 
 ---
 ## پیش‌نیاز:
-##Gost
 برای تانل زدن Gost ابتدا از طریق دستور زیر اقدام به نصب داخل سرور ایران کنید بعد اقدام به ساختن تانل از طریق Gost انجام بدید.
 ```bash
-bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh)
+bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh) --install
 ```
 ## Hysterya2:
 ```bash
-به صورت لوکال دانلود میشه اگه لینک mirror پیدا کردم حتما قرار میده
+bash <(curl -fsSL https://get.hy2.sh/) 
 ```
-
+برای حذف Hysterya2 از این دستور استفاده کنید:
+```bash
+bash <(curl -fsSL https://get.hy2.sh/)
+```
 ## راهنمای سریع
 
 ### مرحله ۱: سرور خارجی
