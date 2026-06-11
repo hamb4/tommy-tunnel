@@ -47,6 +47,7 @@ bash <(curl -fsSL https://github.com/go-gost/gost/raw/master/install.sh) --insta
 ```bash
 bash <(curl -fsSL https://get.hy2.sh/) 
 ```
+---
 ## راهنمای سریع
 
 ### مرحله ۱: سرور خارجی
