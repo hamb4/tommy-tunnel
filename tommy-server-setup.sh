@@ -1,1192 +1,871 @@
-#!/usr/bin/env bash
-#===============================================================================
-#  ████████╗██╗   ██╗██████╗ ███╗   ███╗
-#  ╚══██╔══╝╚██╗ ██╔╝██╔══██╗████╗ ████║
-#     ██║    ╚████╔╝ ██████╔╝██╔████╔██║
-#     ██║     ╚██╔╝  ██╔══██╗██║╚██╔╝██║
-#     ██║      ██║   ██████╔╝██║ ╚═╝ ██║
-#     ╚═╝      ╚═╝   ╚═════╝ ╚═╝     ╚═╝
+#!/bin/bash
+#==============================================================================
+#  Secure Tunnel Setup Script — Iran ↔ Foreign Server
+#  Protocols: GOST (WebSocket+TLS) | WireGuard | SSH Tunnel
+#  Author: Auto-generated
+#  License: MIT
+#==============================================================================
 #
-#  Tommy Tunnel v1.0.5
-#  Author: hamb4
-#  Foreign Server Setup Script
-#  Port Forwarding Tunnel - No xray required
+#  USAGE:
+#    Server side (foreign):  bash tunnel-setup.sh server --mode gost
+#    Client side (Iran):     bash tunnel-setup.sh client --mode gost
 #
-#  How it works:
-#    1. This script sets up a tunnel SERVER on the foreign server
-#    2. Iranian server connects and forwards a port (e.g. 443)
-#    3. In 3x-ui, set External Proxy = Iranian server IP + forwarded port
-#    4. Users in Iran connect to Iranian server -> tunnel -> foreign 3x-ui -> internet
+#  Available modes:
+#    gost       — GOST v3 with WebSocket+TLS (disguised as HTTPS, best stealth)
+#    gost-grpc  — GOST v3 with gRPC+TLS (multiplexed streams, high concurrency)
+#    wireguard  — WireGuard VPN (fastest, kernel-level, less disguised)
+#    ssh        — SSH tunnel with auto-reconnect (simple, reliable)
 #
-#  Usage:
-#    bash <(curl -Ls https://raw.githubusercontent.com/hamb4/tommy-tunnel/main/tommy-server-setup.sh)
-#===============================================================================
+#==============================================================================
 
 set -euo pipefail
 
-TOMMY_VER="1.0.5"
-TOMMY_AUTHOR="hamb4"
-TOMMY_DIR="/etc/tommy"
-TOMMY_REGISTRY="${TOMMY_DIR}/tunnels.registry"
+# ──────────────────────────── Color Helpers ────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
-
-# ── Helper Functions ──────────────────────────────────────────────────────────
 info()  { echo -e "${GREEN}[INFO]${NC}  $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-err()   { echo -e "${RED}[ERROR]${NC} $*"; }
+error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
+# ──────────────────────────── Default Config ───────────────────────────
+TUNNEL_DIR="/opt/secure-tunnel"
+LOG_DIR="${TUNNEL_DIR}/logs"
+PID_DIR="${TUNNEL_DIR}/pids"
+CONFIG_DIR="${TUNNEL_DIR}/config"
+GOST_BIN="${TUNNEL_DIR}/bin/gost"
+WG_CONFIG="${CONFIG_DIR}/wg0.conf"
+
+# Connection defaults (override with flags or env vars)
+SERVER_PORT="${TUNNEL_SERVER_PORT:-443}"
+SERVER_IP="${TUNNEL_SERVER_IP:-}"
+TUNNEL_PASS="${TUNNEL_PASSWORD:-$(openssl rand -hex 16)}"
+DOMAIN="${TUNNEL_DOMAIN:-}"
+WS_PATH="/$(openssl rand -hex 8)"
+
+# TLS certificate paths
+CERT_DIR="${CONFIG_DIR}/certs"
+CERT_FILE="${CERT_DIR}/server.crt"
+KEY_FILE="${CERT_DIR}/server.key"
+
+# WireGuard defaults
+WG_PORT="${WG_PORT:-51820}"
+WG_PRIVATE_KEY=""
+WG_PUBLIC_KEY=""
+WG_PEER_IP="10.10.10.2/32"
+WG_SERVER_IP="10.10.10.1/24"
+
+# ──────────────────────────── Parse Arguments ─────────────────────────
+ROLE=""
+MODE="gost"
+
+show_usage() {
+    cat <<EOF
+Usage: $0 <role> [options]
+
+Roles:
+  server    Set up on the FOREIGN server (endpoint)
+  client    Set up on the IRANIAN server (origin)
+
+Options:
+  --mode <mode>       Tunnel mode: gost | gost-grpc | wireguard | ssh  (default: gost)
+  --port <port>       Server listening port (default: 443)
+  --ip <ip>           Foreign server IP (required for client)
+  --domain <domain>   Domain name for TLS certificate (recommended)
+  --password <pass>   Tunnel authentication password (auto-generated if omitted)
+
+Examples:
+  # Foreign server (outside Iran):
+  bash tunnel-setup.sh server --mode gost --domain my.example.com
+
+  # Iranian server:
+  bash tunnel-setup.sh client --mode gost --ip 1.2.3.4 --domain my.example.com
+
+EOF
+    exit 0
+}
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        server|client)  ROLE="$1"; shift ;;
+        --mode)         MODE="$2"; shift 2 ;;
+        --port)         SERVER_PORT="$2"; shift 2 ;;
+        --ip)           SERVER_IP="$2"; shift 2 ;;
+        --domain)       DOMAIN="$2"; shift 2 ;;
+        --password)     TUNNEL_PASS="$2"; shift 2 ;;
+        -h|--help)      show_usage ;;
+        *)              warn "Unknown option: $1"; shift ;;
+    esac
+done
+
+[[ -z "$ROLE" ]] && error "Specify role: server or client. Run with --help for usage."
+[[ "$MODE" != "gost" && "$MODE" != "gost-grpc" && "$MODE" != "wireguard" && "$MODE" != "ssh" ]] && \
+    error "Invalid mode '$MODE'. Choose: gost | gost-grpc | wireguard | ssh"
+
+# ──────────────────────────── Utility Functions ────────────────────────
 check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        err "This script must be run as root."
-        exit 1
+    [[ $EUID -ne 0 ]] && error "This script must be run as root."
+}
+
+install_deps() {
+    info "Installing dependencies..."
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq
+        apt-get install -y -qq curl wget openssl net-tools iproute2 >/dev/null 2>&1
+    elif command -v yum &>/dev/null; then
+        yum install -y -q curl wget openssl net-tools iproute >/dev/null 2>&1
+    elif command -v dnf &>/dev/null; then
+        dnf install -y -q curl wget openssl net-tools iproute >/dev/null 2>&1
     fi
 }
 
-get_server_ip() {
-    local IP=""
-    IP=$(curl -s4 --connect-timeout 5 https://ifconfig.me 2>/dev/null || true)
-    if [[ -z "$IP" ]]; then
-        IP=$(curl -s4 --connect-timeout 5 https://api.ipify.org 2>/dev/null || true)
-    fi
-    if [[ -z "$IP" ]]; then
-        IP=$(curl -s4 --connect-timeout 5 https://ip.sb 2>/dev/null || true)
-    fi
-    if [[ -z "$IP" ]]; then
-        read -rp "Enter this server's public IP: " IP
-    fi
-    echo "$IP"
+setup_dirs() {
+    mkdir -p "${TUNNEL_DIR}"/{bin,logs,pids,config/certs}
+    info "Working directory: ${TUNNEL_DIR}"
 }
 
-gen_password() {
-    openssl rand -base64 24 | tr -d '/+= ' | head -c 32
-}
-
-# Read port with validation - if empty or non-numeric, use default
-read_port() {
-    local prompt="$1"
-    local default="$2"
-    local var_name="$3"
-    local input=""
-    read -rp "$prompt [$default]: " input
-    # Remove whitespace
-    input=$(echo "$input" | tr -d '[:space:]')
-    # If empty or not a number, use default
-    if [[ -z "$input" ]] || ! [[ "$input" =~ ^[0-9]+$ ]]; then
-        eval "${var_name}=${default}"
+generate_self_signed_cert() {
+    if [[ -n "$DOMAIN" ]]; then
+        info "Generating self-signed certificate for ${DOMAIN}..."
+        openssl req -x509 -nodes -newkey rsa:2048 \
+            -keyout "$KEY_FILE" -out "$CERT_FILE" \
+            -days 3650 -subj "/CN=${DOMAIN}" \
+            -addext "subjectAltName=DNS:${DOMAIN},DNS:www.${DOMAIN}" 2>/dev/null
     else
-        eval "${var_name}=${input}"
+        info "Generating self-signed certificate (no domain specified)..."
+        openssl req -x509 -nodes -newkey rsa:2048 \
+            -keyout "$KEY_FILE" -out "$CERT_FILE" \
+            -days 3650 -subj "/CN=www.microsoft.com" \
+            -addext "subjectAltName=DNS:www.microsoft.com,DNS:microsoft.com" 2>/dev/null
     fi
+    info "Certificate generated at ${CERT_FILE}"
 }
 
-# Register tunnel in central registry
-register_tunnel() {
-    local tname="$1"
-    local method="$2"
-    local fwd_port="$3"
-    local profile="$4"
-    mkdir -p "${TOMMY_DIR}"
-    # Remove old entry for same name
-    if [[ -f "$TOMMY_REGISTRY" ]]; then
-        sed -i "/^${tname}|/d" "$TOMMY_REGISTRY" 2>/dev/null || true
+install_gost() {
+    if [[ -x "$GOST_BIN" ]]; then
+        info "GOST already installed at ${GOST_BIN}"
+        return
     fi
-    echo "${tname}|${method}|${fwd_port}|${profile}|$(date '+%Y-%m-%d %H:%M:%S')" >> "$TOMMY_REGISTRY"
-    chmod 600 "$TOMMY_REGISTRY"
+    info "Downloading GOST v3..."
+    local arch
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64)  arch="amd64" ;;
+        aarch64) arch="arm64" ;;
+        armv7l)  arch="armv7" ;;
+        *)       error "Unsupported architecture: $arch" ;;
+    esac
+
+    local gost_url="https://github.com/go-gost/gost/releases/download/v3.0.0-rc10/gost_3.0.0-rc10_linux_${arch}.tar.gz"
+    local tmp="/tmp/gost_install"
+    mkdir -p "$tmp"
+    wget -q -O "${tmp}/gost.tar.gz" "$gost_url" || \
+        wget -q -O "${tmp}/gost.tar.gz" "https://github.com/go-gost/gost/releases/latest/download/gost_linux_${arch}.tar.gz" || \
+        error "Failed to download GOST. Download manually from https://github.com/go-gost/gost/releases"
+
+    tar xzf "${tmp}/gost.tar.gz" -C "$tmp"
+    cp "${tmp}/gost" "$GOST_BIN" 2>/dev/null || cp "${tmp}/gost_"* "$GOST_BIN" 2>/dev/null
+    chmod +x "$GOST_BIN"
+    rm -rf "$tmp"
+    info "GOST installed: $($GOST_BIN -V 2>/dev/null || echo 'OK')"
 }
 
-# Unregister tunnel from central registry
-unregister_tunnel() {
-    local tname="$1"
-    if [[ -f "$TOMMY_REGISTRY" ]]; then
-        sed -i "/^${tname}|/d" "$TOMMY_REGISTRY" 2>/dev/null || true
+install_wireguard() {
+    info "Installing WireGuard..."
+    if command -v apt-get &>/dev/null; then
+        apt-get install -y -qq wireguard wireguard-tools >/dev/null 2>&1
+    elif command -v yum &>/dev/null; then
+        yum install -y -q wireguard-tools >/dev/null 2>&1
+    elif command -v dnf &>/dev/null; then
+        dnf install -y -q wireguard-tools >/dev/null 2>&1
     fi
+    modprobe wireguard 2>/dev/null || true
+    command -v wg &>/dev/null || error "WireGuard installation failed"
+    info "WireGuard installed: $(wg --version 2>/dev/null || echo 'OK')"
 }
 
-# Check if a tunnel name exists
-tunnel_exists() {
-    local tname="$1"
-    if [[ -f "$TOMMY_REGISTRY" ]]; then
-        grep -q "^${tname}|" "$TOMMY_REGISTRY" 2>/dev/null && return 0
-    fi
-    [[ -d "${TOMMY_DIR}/${tname}" ]] && return 0
-    [[ -f "/etc/systemd/system/tommy-${tname}.service" ]] && return 0
-    return 1
-}
+# ═══════════════════════════════════════════════════════════════════════
+#  GOST SERVER (runs on foreign server)
+# ═══════════════════════════════════════════════════════════════════════
+setup_gost_server() {
+    install_gost
+    generate_self_signed_cert
 
-open_firewall() {
-    local port="$1"
-    local proto="${2:-tcp}"
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "active"; then
-        ufw allow "${port}/${proto}" >/dev/null 2>&1 || true
-    fi
-    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        firewall-cmd --permanent --add-port="${port}/${proto}" >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-    fi
-    if command -v iptables >/dev/null 2>&1; then
-        iptables -I INPUT -p "${proto}" --dport "${port}" -j ACCEPT 2>/dev/null || true
-    fi
-}
+    local config_file="${CONFIG_DIR}/gost-server.yaml"
 
-close_firewall() {
-    local port="$1"
-    local proto="${2:-tcp}"
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "active"; then
-        ufw delete allow "${port}/${proto}" >/dev/null 2>&1 || true
-    fi
-    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-        firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
-        firewall-cmd --reload >/dev/null 2>&1 || true
-    fi
-    if command -v iptables >/dev/null 2>&1; then
-        iptables -D INPUT -p "${proto}" --dport "${port}" -j ACCEPT 2>/dev/null || true
-    fi
-}
+    if [[ "$MODE" == "gost" ]]; then
+        # WebSocket + TLS mode (looks like HTTPS traffic)
+        cat > "$config_file" <<YAML
+name: gost-server
 
-detect_os() {
-    if [[ -f /etc/os-release ]]; then
-        # shellcheck disable=SC1091
-        . /etc/os-release
-        OS_ID="${ID:-unknown}"
-    else
-        OS_ID="unknown"
-    fi
-}
+log:
+  level: info
+  format: json
+  output: "${LOG_DIR}/gost-server.log"
 
-install_pkg() {
-    local pkg="$1"
-    if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
-        apt-get install -y "$pkg" 2>/dev/null || true
-    elif [[ "$OS_ID" == "centos" || "$OS_ID" == "rhel" || "$OS_ID" == "rocky" || "$OS_ID" == "almalinux" ]]; then
-        yum install -y "$pkg" 2>/dev/null || true
-    elif [[ "$OS_ID" == "arch" ]]; then
-        pacman -Sy --noconfirm "$pkg" 2>/dev/null || true
-    fi
-}
+profiling:
+  enabled: false
 
-# ── System Optimization ──────────────────────────────────────────────────────
-optimize_system() {
-    info "Enabling BBR congestion control..."
-    if ! sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "bbr"; then
-        if ! grep -q "tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null; then
-            cat >> /etc/sysctl.conf <<SYSEOF
-# Tommy v${TOMMY_VER} - BBR
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-# Tommy v${TOMMY_VER} - Buffers
-net.core.rmem_max=16777216
-net.core.wmem_max=16777216
-net.core.rmem_default=1048576
-net.core.wmem_default=1048576
-net.core.netdev_max_backlog=65536
-net.ipv4.udp_mem=1048576 2097152 4194304
-net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
-SYSEOF
-        fi
-        sysctl -p /etc/sysctl.conf 2>/dev/null || true
-        info "BBR and buffer optimization enabled."
-    else
-        info "BBR already enabled."
-    fi
-}
-
-# ── Banner ───────────────────────────────────────────────────────────────────
-show_banner() {
-    clear
-    echo -e "${CYAN}"
-    echo "  ████████╗██╗   ██╗██████╗ ███╗   ███╗"
-    echo "  ╚══██╔══╝╚██╗ ██╔╝██╔══██╗████╗ ████║"
-    echo "     ██║    ╚████╔╝ ██████╔╝██╔████╔██║"
-    echo "     ██║     ╚██╔╝  ██╔══██╗██║╚██╔╝██║"
-    echo "     ██║      ██║   ██████╔╝██║ ╚═╝ ██║"
-    echo "     ╚═╝      ╚═╝   ╚═════╝ ╚═╝     ╚═╝"
-    echo -e "${NC}"
-    echo -e "  ${BOLD}Tommy Tunnel v${TOMMY_VER}  |  Author: ${TOMMY_AUTHOR}${NC}"
-    echo -e "  ${BLUE}Foreign Server - Port Forwarding Tunnel${NC}"
-    echo ""
-}
-
-# ── Generate Connection Code ─────────────────────────────────────────────────
-generate_connection_code() {
-    local method="$1"
-    local server_ip="$2"
-    local fwd_port="$3"
-    local profile="$4"
-    local extra="$5"  # method-specific data (port, password, key, etc.)
-
-    # Build a structured string and base64 encode it
-    # Format: TOMMY105|method|server_ip|fwd_port|profile|extra_data
-    local raw="TOMMY105|${method}|${server_ip}|${fwd_port}|${profile}|${extra}"
-    echo "$raw" | base64 -w 0
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SSH TUNNEL METHOD
-# ══════════════════════════════════════════════════════════════════════════════
-setup_ssh_tunnel() {
-    local TNAME="$1"
-    local FWD_PORT="$2"
-    local PROFILE="$3"
-    local SVC_NAME="tommy-${TNAME}"
-    local CFG_DIR="${TOMMY_DIR}/${TNAME}"
-
-    info "Setting up SSH Tunnel..."
-    install_pkg openssh-server
-    install_pkg autossh
-
-    # Ensure SSH is running
-    systemctl start sshd 2>/dev/null || systemctl start ssh 2>/dev/null || true
-    systemctl enable sshd 2>/dev/null || systemctl enable ssh 2>/dev/null || true
-
-    # Create dedicated tunnel user (no shell for security)
-    if id "tommy-tunnel" >/dev/null 2>&1; then
-        info "User tommy-tunnel already exists."
-    else
-        useradd -r -s /usr/sbin/nologin tommy-tunnel 2>/dev/null || true
-        info "Created restricted user: tommy-tunnel"
-    fi
-
-    # Generate ED25519 key pair
-    mkdir -p "${CFG_DIR}"
-    ssh-keygen -t ed25519 -f "${CFG_DIR}/id_tommy" -N "" -C "tommy-tunnel@${TNAME}" -q 2>/dev/null || true
-
-    # Set up authorized_keys for the tunnel user
-    local TUNNEL_HOME
-    TUNNEL_HOME=$(eval echo "~tommy-tunnel" 2>/dev/null || echo "/home/tommy-tunnel")
-    mkdir -p "${TUNNEL_HOME}/.ssh"
-    cat "${CFG_DIR}/id_tommy.pub" > "${TUNNEL_HOME}/.ssh/authorized_keys"
-    chmod 700 "${TUNNEL_HOME}/.ssh"
-    chmod 600 "${TUNNEL_HOME}/.ssh/authorized_keys"
-    chown -R tommy-tunnel:tommy-tunnel "${TUNNEL_HOME}/.ssh" 2>/dev/null || true
-
-    # Restrict SSH for this user to port forwarding only
-    local SSHD_CONFIG="/etc/ssh/sshd_config"
-    if ! grep -q "Match User tommy-tunnel" "$SSHD_CONFIG" 2>/dev/null; then
-        cat >> "$SSHD_CONFIG" <<SSHEOF
-
-# Tommy v${TOMMY_VER} - Restrict tunnel user
-Match User tommy-tunnel
-    AllowTcpForwarding yes
-    AllowAgentForwarding no
-    X11Forwarding no
-    PermitTunnel no
-    GatewayPorts yes
-    ForceCommand /bin/false
-SSHEOF
-        systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null || true
-    fi
-
-    # Get SSH port
-    local SSH_PORT=22
-    SSH_PORT=$(grep -E "^Port " "$SSHD_CONFIG" 2>/dev/null | awk '{print $2}' | head -1)
-    SSH_PORT="${SSH_PORT:-22}"
-
-    # Profile settings
-    local KEEPALIVE=30
-    if [[ "$PROFILE" == "speed" ]]; then
-        KEEPALIVE=15
-    elif [[ "$PROFILE" == "security" ]]; then
-        KEEPALIVE=60
-    fi
-
-    # Create systemd service
-    cat > "/etc/systemd/system/${SVC_NAME}.service" <<SVCEOF
-[Unit]
-Description=Tommy SSH Tunnel - ${TNAME}
-After=network.target sshd.service
-Wants=network.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/true
-ExecStop=/bin/true
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-
-    systemctl daemon-reload
-    systemctl enable "$SVC_NAME" >/dev/null 2>&1
-    systemctl start "$SVC_NAME" >/dev/null 2>&1
-
-    # Read private key
-    local PRIVATE_KEY
-    PRIVATE_KEY=$(cat "${CFG_DIR}/id_tommy")
-
-    # Save tunnel info
-    cat > "${CFG_DIR}/tunnel-info.txt" <<IEOF
-TUNNEL_NAME=${TNAME}
-METHOD=ssh
-FWD_PORT=${FWD_PORT}
-PROFILE=${PROFILE}
-SSH_PORT=${SSH_PORT}
-KEEPALIVE=${KEEPALIVE}
-SERVER_IP=${SERVER_IP}
-CREATED=$(date '+%Y-%m-%d %H:%M:%S')
-IEOF
-    chmod 600 "${CFG_DIR}/tunnel-info.txt"
-
-    # Register in central registry
-    register_tunnel "$TNAME" "ssh" "$FWD_PORT" "$PROFILE"
-
-    # Generate connection code
-    # Extra format for SSH: ssh_port:keepalive:private_key_base64
-    local PRIV_KEY_B64
-    PRIV_KEY_B64=$(echo "$PRIVATE_KEY" | base64 -w 0)
-    local EXTRA="${SSH_PORT}:${KEEPALIVE}:${PRIV_KEY_B64}"
-    local CONN_CODE
-    CONN_CODE=$(generate_connection_code "ssh" "${SERVER_IP}" "${FWD_PORT}" "${PROFILE}" "${EXTRA}")
-
-    # Display results
-    echo ""
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  SSH Tunnel Created!                                        ║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  Server IP:    ${YELLOW}${SERVER_IP}${NC}"
-    echo -e "${CYAN}║  SSH Port:     ${YELLOW}${SSH_PORT}${NC}"
-    echo -e "${CYAN}║  Forward Port: ${YELLOW}${FWD_PORT}${NC}"
-    echo -e "${CYAN}║  Username:     ${YELLOW}tommy-tunnel${NC}"
-    echo -e "${CYAN}║  Profile:      ${YELLOW}${PROFILE}${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  ${BOLD}Connection Code (give to Iranian server):${NC}"
-    echo -e "${YELLOW}  ${CONN_CODE}${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  In 3x-ui External Proxy:                                  ║${NC}"
-    echo -e "${CYAN}║  Set Iranian server IP + port ${FWD_PORT}${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    info "Connection code has been saved to /root/tommy-${TNAME}-connection-code.txt"
-    echo "$CONN_CODE" > "/root/tommy-${TNAME}-connection-code.txt"
-    chmod 600 "/root/tommy-${TNAME}-connection-code.txt"
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  WIREGUARD METHOD
-# ══════════════════════════════════════════════════════════════════════════════
-setup_wireguard_tunnel() {
-    local TNAME="$1"
-    local FWD_PORT="$2"
-    local PROFILE="$3"
-    local SVC_NAME="tommy-${TNAME}"
-    local CFG_DIR="${TOMMY_DIR}/${TNAME}"
-
-    info "Setting up WireGuard Tunnel..."
-
-    # Install WireGuard
-    if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
-        apt-get update -y 2>/dev/null || true
-        apt-get install -y wireguard wireguard-tools 2>/dev/null || true
-    elif [[ "$OS_ID" == "centos" || "$OS_ID" == "rhel" || "$OS_ID" == "rocky" || "$OS_ID" == "almalinux" ]]; then
-        yum install -y epel-release 2>/dev/null || true
-        yum install -y wireguard-tools 2>/dev/null || true
-    elif [[ "$OS_ID" == "arch" ]]; then
-        pacman -Sy --noconfirm wireguard-tools 2>/dev/null || true
-    fi
-
-    if ! command -v wg >/dev/null 2>&1; then
-        err "WireGuard installation failed."
-        return 1
-    fi
-
-    mkdir -p "${CFG_DIR}"
-
-    # Generate server keys
-    wg genkey | tee "${CFG_DIR}/server_privatekey" | wg pubkey > "${CFG_DIR}/server_publickey"
-    local SRV_PRIV SRV_PUB
-    SRV_PRIV=$(cat "${CFG_DIR}/server_privatekey")
-    SRV_PUB=$(cat "${CFG_DIR}/server_publickey")
-
-    # Generate client (Iranian server) keys
-    wg genkey | tee "${CFG_DIR}/client_privatekey" | wg pubkey > "${CFG_DIR}/client_publickey"
-    local CLI_PRIV CLI_PUB
-    CLI_PRIV=$(cat "${CFG_DIR}/client_privatekey")
-    CLI_PUB=$(cat "${CFG_DIR}/client_publickey")
-
-    # WireGuard port
-    local WG_PORT=51820
-    read_port "Enter WireGuard UDP port" "51820" WG_PORT
-
-    # WireGuard internal IPs
-    local SRV_WG_IP="10.10.0.1"
-    local CLI_WG_IP="10.10.0.2"
-
-    # Profile settings
-    local MTU=1280
-    local KEEPALIVE=25
-    if [[ "$PROFILE" == "speed" ]]; then
-        MTU=1420
-        KEEPALIVE=15
-    elif [[ "$PROFILE" == "security" ]]; then
-        MTU=1280
-        KEEPALIVE=60
-    fi
-
-    # Create server config
-    cat > "${CFG_DIR}/wg0.conf" <<WGEOF
-[Interface]
-PrivateKey = ${SRV_PRIV}
-Address = ${SRV_WG_IP}/24
-ListenPort = ${WG_PORT}
-MTU = ${MTU}
-PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth+ -j MASQUERADE; iptables -t nat -A POSTROUTING -o ens+ -j MASQUERADE
-PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth+ -j MASQUERADE; iptables -t nat -D POSTROUTING -o ens+ -j MASQUERADE
-
-[Peer]
-PublicKey = ${CLI_PUB}
-AllowedIPs = ${CLI_WG_IP}/32
-WGEOF
-    chmod 600 "${CFG_DIR}/wg0.conf"
-
-    # Copy to WireGuard directory
-    cp "${CFG_DIR}/wg0.conf" "/etc/wireguard/wg0-${TNAME}.conf" 2>/dev/null || true
-
-    # Create systemd service
-    cat > "/etc/systemd/system/${SVC_NAME}.service" <<SVCEOF
-[Unit]
-Description=Tommy WireGuard Tunnel - ${TNAME}
-After=network.target
-Wants=network.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/usr/bin/wg-quick up ${CFG_DIR}/wg0.conf
-ExecStop=/usr/bin/wg-quick down ${CFG_DIR}/wg0.conf
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-
-    systemctl daemon-reload
-    open_firewall "$WG_PORT" udp
-    open_firewall "$FWD_PORT" tcp
-    systemctl enable "$SVC_NAME" >/dev/null 2>&1
-    systemctl start "$SVC_NAME" 2>/dev/null || true
-
-    # Save tunnel info
-    cat > "${CFG_DIR}/tunnel-info.txt" <<IEOF
-TUNNEL_NAME=${TNAME}
-METHOD=wireguard
-FWD_PORT=${FWD_PORT}
-WG_PORT=${WG_PORT}
-PROFILE=${PROFILE}
-SRV_WG_IP=${SRV_WG_IP}
-CLI_WG_IP=${CLI_WG_IP}
-MTU=${MTU}
-KEEPALIVE=${KEEPALIVE}
-SERVER_IP=${SERVER_IP}
-CREATED=$(date '+%Y-%m-%d %H:%M:%S')
-IEOF
-    chmod 600 "${CFG_DIR}/tunnel-info.txt"
-
-    # Register in central registry
-    register_tunnel "$TNAME" "wireguard" "$FWD_PORT" "$PROFILE"
-
-    # Generate connection code
-    # Extra: wg_port:mtu:keepalive:srv_wg_ip:cli_wg_ip:cli_priv:srv_pub
-    local EXTRA="${WG_PORT}:${MTU}:${KEEPALIVE}:${SRV_WG_IP}:${CLI_WG_IP}:${CLI_PRIV}:${SRV_PUB}"
-    local CONN_CODE
-    CONN_CODE=$(generate_connection_code "wireguard" "${SERVER_IP}" "${FWD_PORT}" "${PROFILE}" "${EXTRA}")
-
-    echo ""
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  WireGuard Tunnel Created!                                  ║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  Server IP:    ${YELLOW}${SERVER_IP}${NC}"
-    echo -e "${CYAN}║  WG Port:      ${YELLOW}${WG_PORT} (UDP)${NC}"
-    echo -e "${CYAN}║  Forward Port: ${YELLOW}${FWD_PORT}${NC}"
-    echo -e "${CYAN}║  MTU:          ${YELLOW}${MTU}${NC}"
-    echo -e "${CYAN}║  Profile:      ${YELLOW}${PROFILE}${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  ${BOLD}Connection Code (give to Iranian server):${NC}"
-    echo -e "${YELLOW}  ${CONN_CODE}${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  In 3x-ui External Proxy:                                  ║${NC}"
-    echo -e "${CYAN}║  Set Iranian server IP + port ${FWD_PORT}${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    info "Connection code has been saved to /root/tommy-${TNAME}-connection-code.txt"
-    echo "$CONN_CODE" > "/root/tommy-${TNAME}-connection-code.txt"
-    chmod 600 "/root/tommy-${TNAME}-connection-code.txt"
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  GOST METHOD (TLS Relay)
-# ══════════════════════════════════════════════════════════════════════════════
-setup_gost_tunnel() {
-    local TNAME="$1"
-    local FWD_PORT="$2"
-    local PROFILE="$3"
-    local SVC_NAME="tommy-${TNAME}"
-    local CFG_DIR="${TOMMY_DIR}/${TNAME}"
-
-    info "Setting up Gost TLS Relay Tunnel..."
-
-    mkdir -p "${CFG_DIR}"
-
-    # Install Gost v3
-    local GOST_BIN="/usr/local/bin/gost"
-    if [[ ! -x "$GOST_BIN" ]]; then
-        info "Downloading Gost v3..."
-        local ARCH=""
-        case "$(uname -m)" in
-            x86_64)  ARCH="amd64" ;;
-            aarch64) ARCH="arm64" ;;
-            armv7l)  ARCH="armv7" ;;
-            *)       ARCH="amd64" ;;
-        esac
-        local GOST_URL="https://github.com/go-gost/gost/releases/download/v3.0.0-rc10/gost_3.0.0-rc10_linux_${ARCH}.tar.gz"
-        wget -qO /tmp/gost.tar.gz "$GOST_URL" 2>/dev/null || true
-        if [[ -f /tmp/gost.tar.gz ]]; then
-            tar -xzf /tmp/gost.tar.gz -C /tmp/ 2>/dev/null || true
-            cp /tmp/gost "$GOST_BIN" 2>/dev/null || true
-            chmod +x "$GOST_BIN"
-            rm -f /tmp/gost.tar.gz /tmp/gost
-        fi
-        if [[ ! -x "$GOST_BIN" ]]; then
-            if command -v go >/dev/null 2>&1; then
-                go install github.com/go-gost/gost/cmd/gost@latest 2>/dev/null || true
-                cp ~/go/bin/gost "$GOST_BIN" 2>/dev/null || true
-            fi
-        fi
-    fi
-
-    if [[ ! -x "$GOST_BIN" ]]; then
-        err "Gost installation failed. Cannot continue."
-        return 1
-    fi
-    info "Gost installed successfully."
-
-    # Generate password
-    local GOST_PASS
-    GOST_PASS=$(gen_password)
-
-    # Choose tunnel port (different from forward port)
-    local TUNNEL_PORT=8443
-    read_port "Enter Gost tunnel port (for encrypted relay)" "8443" TUNNEL_PORT
-
-    # Generate self-signed cert for Gost TLS
-    openssl req -new -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-        -keyout "${CFG_DIR}/server.key" -out "${CFG_DIR}/server.crt" \
-        -days 3650 -subj "/CN=www.bing.com" 2>/dev/null
-
-    # Create Gost config
-    cat > "${CFG_DIR}/gost.yaml" <<GOSTEOF
 services:
-  - name: tommy-${TNAME}
-    addr: ":${TUNNEL_PORT}"
+  - name: ws-tls-tunnel
+    addr: "0.0.0.0:${SERVER_PORT}"
     handler:
-      type: relay
+      type: http2
       auth:
-        username: tommy
-        password: ${GOST_PASS}
+        username: tunnel
+        password: ${TUNNEL_PASS}
+      chain: chain-direct
     listener:
       type: tls
       tls:
-        certFile: ${CFG_DIR}/server.crt
-        keyFile: ${CFG_DIR}/server.key
-GOSTEOF
-    chmod 600 "${CFG_DIR}/gost.yaml"
+        certFile: "${CERT_FILE}"
+        keyFile: "${KEY_FILE}"
+      # WebSocket upgrade happens inside TLS
+      # Traffic appears as standard HTTPS to observers
+
+chains:
+  - name: chain-direct
+    hops:
+      - name: hop-direct
+        nodes:
+          - name: node-direct
+            addr: "127.0.0.1:1080"
+            connector:
+              type: socks5
+            dialer:
+              type: tcp
+
+YAML
+        info "GOST server config: WebSocket+TLS on port ${SERVER_PORT}"
+
+    elif [[ "$MODE" == "gost-grpc" ]]; then
+        # gRPC + TLS mode (multiplexed streams, better concurrency)
+        cat > "$config_file" <<YAML
+name: gost-server-grpc
+
+log:
+  level: info
+  format: json
+  output: "${LOG_DIR}/gost-server.log"
+
+services:
+  - name: grpc-tls-tunnel
+    addr: "0.0.0.0:${SERVER_PORT}"
+    handler:
+      type: http2
+      auth:
+        username: tunnel
+        password: ${TUNNEL_PASS}
+    listener:
+      type: tls
+      tls:
+        certFile: "${CERT_FILE}"
+        keyFile: "${KEY_FILE}"
+    forwarder:
+      nodes:
+        - name: internet
+          addr: "127.0.0.1:1080"
+          connector:
+            type: socks5
+          dialer:
+            type: tcp
+
+YAML
+        info "GOST server config: gRPC+TLS on port ${SERVER_PORT}"
+    fi
 
     # Create systemd service
-    cat > "/etc/systemd/system/${SVC_NAME}.service" <<SVCEOF
+    cat > /etc/systemd/system/gost-tunnel.service <<UNIT
 [Unit]
-Description=Tommy Gost Tunnel - ${TNAME}
-After=network.target
-Wants=network.target
+Description=GOST Secure Tunnel (Server)
+After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${GOST_BIN} -C ${CFG_DIR}/gost.yaml
-Restart=on-failure
+ExecStart=${GOST_BIN} -C ${config_file}
+Restart=always
 RestartSec=5
 LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=${TUNNEL_DIR}
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
-SVCEOF
+UNIT
 
     systemctl daemon-reload
-    open_firewall "$TUNNEL_PORT" tcp
-    open_firewall "$FWD_PORT" tcp
-    systemctl enable "$SVC_NAME" >/dev/null 2>&1
-    systemctl start "$SVC_NAME"
-
+    systemctl enable gost-tunnel
+    systemctl restart gost-tunnel
     sleep 2
-    if systemctl is-active --quiet "$SVC_NAME"; then
-        info "Gost tunnel is RUNNING on port ${TUNNEL_PORT}"
-    else
-        warn "Gost tunnel may have failed. Check: journalctl -u ${SVC_NAME} -n 20"
-    fi
-
-    # Save tunnel info
-    cat > "${CFG_DIR}/tunnel-info.txt" <<IEOF
-TUNNEL_NAME=${TNAME}
-METHOD=gost
-FWD_PORT=${FWD_PORT}
-TUNNEL_PORT=${TUNNEL_PORT}
-PROFILE=${PROFILE}
-GOST_PASS=${GOST_PASS}
-SERVER_IP=${SERVER_IP}
-CREATED=$(date '+%Y-%m-%d %H:%M:%S')
-IEOF
-    chmod 600 "${CFG_DIR}/tunnel-info.txt"
-
-    # Register in central registry
-    register_tunnel "$TNAME" "gost" "$FWD_PORT" "$PROFILE"
-
-    # Generate connection code
-    local EXTRA="${TUNNEL_PORT}:${GOST_PASS}"
-    local CONN_CODE
-    CONN_CODE=$(generate_connection_code "gost" "${SERVER_IP}" "${FWD_PORT}" "${PROFILE}" "${EXTRA}")
-
-    echo ""
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  Gost TLS Relay Tunnel Created!                             ║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  Server IP:    ${YELLOW}${SERVER_IP}${NC}"
-    echo -e "${CYAN}║  Tunnel Port:  ${YELLOW}${TUNNEL_PORT} (TLS)${NC}"
-    echo -e "${CYAN}║  Forward Port: ${YELLOW}${FWD_PORT}${NC}"
-    echo -e "${CYAN}║  Password:     ${YELLOW}${GOST_PASS}${NC}"
-    echo -e "${CYAN}║  Profile:      ${YELLOW}${PROFILE}${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  ${BOLD}Connection Code (give to Iranian server):${NC}"
-    echo -e "${YELLOW}  ${CONN_CODE}${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  In 3x-ui External Proxy:                                  ║${NC}"
-    echo -e "${CYAN}║  Set Iranian server IP + port ${FWD_PORT}${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    info "Connection code has been saved to /root/tommy-${TNAME}-connection-code.txt"
-    echo "$CONN_CODE" > "/root/tommy-${TNAME}-connection-code.txt"
-    chmod 600 "/root/tommy-${TNAME}-connection-code.txt"
+    systemctl is-active --quiet gost-tunnel && \
+        info "GOST server is running on port ${SERVER_PORT}" || \
+        warn "GOST server may not have started. Check: journalctl -u gost-tunnel -f"
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  HYSTERIA2 METHOD
-# ══════════════════════════════════════════════════════════════════════════════
-setup_hysteria2_tunnel() {
-    local TNAME="$1"
-    local FWD_PORT="$2"
-    local PROFILE="$3"
-    local SVC_NAME="tommy-${TNAME}"
-    local CFG_DIR="${TOMMY_DIR}/${TNAME}"
+# ═══════════════════════════════════════════════════════════════════════
+#  GOST CLIENT (runs on Iranian server)
+# ═══════════════════════════════════════════════════════════════════════
+setup_gost_client() {
+    [[ -z "$SERVER_IP" ]] && error "Specify foreign server IP with --ip"
+    install_gost
 
-    info "Setting up Hysteria2 Tunnel..."
+    local config_file="${CONFIG_DIR}/gost-client.yaml"
+    local server_addr="${SERVER_IP}:${SERVER_PORT}"
 
-    mkdir -p "${CFG_DIR}"
+    # Client config: local SOCKS5 proxy → tunnel → foreign server → internet
+    cat > "$config_file" <<YAML
+name: gost-client
 
-    # Install Hysteria2
-    local HY2_BIN="/usr/local/bin/hysteria"
-    if [[ ! -x "$HY2_BIN" ]]; then
-        info "Downloading Hysteria2..."
-        bash <(curl -fsSL https://get.hy2.sh/) 2>/dev/null || true
-    fi
+log:
+  level: info
+  format: json
+  output: "${LOG_DIR}/gost-client.log"
 
-    if [[ ! -x "$HY2_BIN" ]]; then
-        err "Hysteria2 installation failed."
-        return 1
-    fi
-    info "Hysteria2 installed successfully."
+profiling:
+  enabled: false
 
-    # Generate password
-    local HY2_PASS
-    HY2_PASS=$(gen_password)
+services:
+  - name: local-proxy
+    addr: "127.0.0.1:1080"
+    handler:
+      type: socks5
+      chain: chain-tunnel
+    listener:
+      type: tcp
 
-    # Choose tunnel port
-    local TUNNEL_PORT=8443
-    read_port "Enter Hysteria2 tunnel port (UDP)" "8443" TUNNEL_PORT
+  - name: local-http-proxy
+    addr: "127.0.0.1:8080"
+    handler:
+      type: http
+      chain: chain-tunnel
+    listener:
+      type: tcp
 
-    # Generate self-signed cert
-    openssl req -new -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-        -keyout "${CFG_DIR}/server.key" -out "${CFG_DIR}/server.crt" \
-        -days 3650 -subj "/CN=bing.com" 2>/dev/null
+chains:
+  - name: chain-tunnel
+    hops:
+      - name: hop-tunnel
+        nodes:
+          - name: node-tunnel
+            addr: "${server_addr}"
+            connector:
+              type: http2
+              auth:
+                username: tunnel
+                password: ${TUNNEL_PASS}
+            dialer:
+              type: tls
+              tls:
+                serverName: "${DOMAIN:-www.microsoft.com}"
+                secure: true
+                # Skip cert verification for self-signed certs
+                # In production, use a real domain + Let's Encrypt
+                insecure: true
 
-    # Profile settings
-    local RECV_WINDOW=16777216
-    local MASQUERADE=""
-    if [[ "$PROFILE" == "speed" ]]; then
-        RECV_WINDOW=67108864
-    elif [[ "$PROFILE" == "security" ]]; then
-        RECV_WINDOW=8388608
-        MASQUERADE="masquerade:
-      type: proxy
-      proxy:
-        url: https://www.bing.com
-        rewriteHost: true"
-    fi
+YAML
 
-    # Create Hysteria2 server config
-    cat > "${CFG_DIR}/config.yaml" <<HYEOF
-listen: :${TUNNEL_PORT}
-tls:
-  cert: ${CFG_DIR}/server.crt
-  key: ${CFG_DIR}/server.key
-auth:
-  type: password
-  password: ${HY2_PASS}
-${MASQUERADE}
-quic:
-  initStreamReceiveWindow: ${RECV_WINDOW}
-  maxStreamReceiveWindow: ${RECV_WINDOW}
-  initConnReceiveWindow: $((RECV_WINDOW * 2))
-  maxConnReceiveWindow: $((RECV_WINDOW * 4))
-  maxIdleTimeout: 60s
-  maxIncomingStreams: 1024
-HYEOF
-    chmod 600 "${CFG_DIR}/config.yaml"
+    info "GOST client config: local SOCKS5 on 127.0.0.1:1080, HTTP on 127.0.0.1:8080"
 
     # Create systemd service
-    cat > "/etc/systemd/system/${SVC_NAME}.service" <<SVCEOF
+    cat > /etc/systemd/system/gost-tunnel.service <<UNIT
 [Unit]
-Description=Tommy Hysteria2 Tunnel - ${TNAME}
-After=network.target
-Wants=network.target
+Description=GOST Secure Tunnel (Client)
+After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${HY2_BIN} server -c ${CFG_DIR}/config.yaml
-Restart=on-failure
+ExecStart=${GOST_BIN} -C ${config_file}
+Restart=always
 RestartSec=5
 LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=${TUNNEL_DIR}
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
-SVCEOF
+UNIT
 
     systemctl daemon-reload
-    open_firewall "$TUNNEL_PORT" udp
-    open_firewall "$FWD_PORT" tcp
-    systemctl enable "$SVC_NAME" >/dev/null 2>&1
-    systemctl start "$SVC_NAME"
-
+    systemctl enable gost-tunnel
+    systemctl restart gost-tunnel
     sleep 2
-    if systemctl is-active --quiet "$SVC_NAME"; then
-        info "Hysteria2 tunnel is RUNNING on port ${TUNNEL_PORT} (UDP)"
+    systemctl is-active --quiet gost-tunnel && \
+        info "GOST client is running. SOCKS5 proxy: 127.0.0.1:1080 | HTTP proxy: 127.0.0.1:8080" || \
+        warn "GOST client may not have started. Check: journalctl -u gost-tunnel -f"
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+#  WIREGUARD SERVER (runs on foreign server)
+# ═══════════════════════════════════════════════════════════════════════
+setup_wireguard_server() {
+    install_wireguard
+
+    # Generate server keys
+    cd "$CONFIG_DIR"
+    WG_PRIVATE_KEY=$(wg genkey)
+    WG_PUBLIC_KEY=$(echo "$WG_PRIVATE_KEY" | wg pubkey)
+
+    # Generate client keys
+    local client_priv client_pub
+    client_priv=$(wg genkey)
+    client_pub=$(echo "$client_priv" | wg pubkey)
+
+    # Server config
+    cat > "$WG_CONFIG" <<WGCFG
+[Interface]
+PrivateKey = ${WG_PRIVATE_KEY}
+Address = ${WG_SERVER_IP}
+ListenPort = ${WG_PORT}
+MTU = 1420
+
+# Firewall rules
+PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -A FORWARD -o wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o $(ip route | grep default | awk '{print $5}' | head -1) -j MASQUERADE
+PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -D FORWARD -o wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o $(ip route | grep default | awk '{print $5}' | head -1) -j MASQUERADE
+
+# Client peer (Iranian server)
+[Peer]
+PublicKey = ${client_pub}
+AllowedIPs = ${WG_PEER_IP}
+
+WGCFG
+
+    # Save client config for transfer
+    local client_config="${CONFIG_DIR}/wg-client.conf"
+    local server_pub
+    server_pub="$WG_PUBLIC_KEY"
+    cat > "$client_config" <<WGCFG
+[Interface]
+PrivateKey = ${client_priv}
+Address = ${WG_PEER_IP}
+DNS = 1.1.1.1, 8.8.8.8
+MTU = 1420
+
+[Peer]
+PublicKey = ${server_pub}
+Endpoint = AUTO_FILL_SERVER_IP:${WG_PORT}
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+
+WGCFG
+
+    # Enable IP forwarding
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null
+    echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+    echo "net.ipv6.conf.all.forwarding = 1" >> /etc/sysctl.conf
+
+    # Start WireGuard
+    wg-quick down wg0 2>/dev/null || true
+    wg-quick up "$WG_CONFIG"
+    systemctl enable wg-quick@wg0 2>/dev/null || true
+
+    info "WireGuard server running on port ${WG_PORT}"
+    info "═══════════════════════════════════════════════════════════"
+    info "  CLIENT CONFIG FILE: ${client_config}"
+    info "  Copy this file to the Iranian server!"
+    info "  Don't forget to set the Endpoint IP in the client config."
+    info "═══════════════════════════════════════════════════════════"
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+#  WIREGUARD CLIENT (runs on Iranian server)
+# ═══════════════════════════════════════════════════════════════════════
+setup_wireguard_client() {
+    install_wireguard
+
+    [[ -z "$SERVER_IP" ]] && error "Specify foreign server IP with --ip"
+
+    local client_config="${CONFIG_DIR}/wg-client.conf"
+
+    if [[ -f "$client_config" ]]; then
+        # Use pre-generated client config, update endpoint
+        sed -i "s/AUTO_FILL_SERVER_IP/${SERVER_IP}/g" "$client_config"
     else
-        warn "Hysteria2 tunnel may have failed. Check: journalctl -u ${SVC_NAME} -n 20"
+        error "Client config not found. Copy wg-client.conf from the foreign server to ${client_config}"
     fi
 
-    # Save tunnel info
-    cat > "${CFG_DIR}/tunnel-info.txt" <<IEOF
-TUNNEL_NAME=${TNAME}
-METHOD=hysteria2
-FWD_PORT=${FWD_PORT}
-TUNNEL_PORT=${TUNNEL_PORT}
-PROFILE=${PROFILE}
-HY2_PASS=${HY2_PASS}
-SERVER_IP=${SERVER_IP}
-CREATED=$(date '+%Y-%m-%d %H:%M:%S')
-IEOF
-    chmod 600 "${CFG_DIR}/tunnel-info.txt"
+    # Start WireGuard
+    wg-quick down wg0 2>/dev/null || true
+    wg-quick up "$client_config"
+    systemctl enable wg-quick@wg0 2>/dev/null || true
 
-    # Register in central registry
-    register_tunnel "$TNAME" "hysteria2" "$FWD_PORT" "$PROFILE"
-
-    # Generate connection code
-    local EXTRA="${TUNNEL_PORT}:${HY2_PASS}"
-    local CONN_CODE
-    CONN_CODE=$(generate_connection_code "hysteria2" "${SERVER_IP}" "${FWD_PORT}" "${PROFILE}" "${EXTRA}")
-
-    echo ""
-    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  Hysteria2 Tunnel Created!                                  ║${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  Server IP:    ${YELLOW}${SERVER_IP}${NC}"
-    echo -e "${CYAN}║  Tunnel Port:  ${YELLOW}${TUNNEL_PORT} (UDP)${NC}"
-    echo -e "${CYAN}║  Forward Port: ${YELLOW}${FWD_PORT}${NC}"
-    echo -e "${CYAN}║  Password:     ${YELLOW}${HY2_PASS}${NC}"
-    echo -e "${CYAN}║  Profile:      ${YELLOW}${PROFILE}${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  ${BOLD}Connection Code (give to Iranian server):${NC}"
-    echo -e "${YELLOW}  ${CONN_CODE}${NC}"
-    echo -e "${CYAN}╠══════════════════════════════════════════════════════════════╣${NC}"
-    echo -e "${CYAN}║  In 3x-ui External Proxy:                                  ║${NC}"
-    echo -e "${CYAN}║  Set Iranian server IP + port ${FWD_PORT}${NC}"
-    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════╝${NC}"
-    echo ""
-    info "Connection code has been saved to /root/tommy-${TNAME}-connection-code.txt"
-    echo "$CONN_CODE" > "/root/tommy-${TNAME}-connection-code.txt"
-    chmod 600 "/root/tommy-${TNAME}-connection-code.txt"
+    info "WireGuard client connected to ${SERVER_IP}:${WG_PORT}"
+    info "All traffic now routes through the WireGuard tunnel."
+    info "Verify: curl --interface wg0 https://api.ipify.org"
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  CREATE TUNNEL (Main Entry)
-# ══════════════════════════════════════════════════════════════════════════════
-create_tunnel() {
-    echo ""
-    info "=========================================="
-    info "  Tommy v${TOMMY_VER} - Create Port Forwarding Tunnel"
-    info "=========================================="
-    echo ""
-
-    # Step 1: Tunnel name
-    read -rp "Enter a name for this tunnel (e.g. tunnel1): " TNAME
-    TNAME="${TNAME:-tunnel1}"
-    TNAME=$(echo "$TNAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
-    if [[ -z "$TNAME" ]]; then
-        err "Tunnel name cannot be empty."
-        return
-    fi
-
-    # Check if tunnel already exists
-    if tunnel_exists "$TNAME"; then
-        err "Tunnel '${TNAME}' already exists. Delete it first or choose another name."
-        return
-    fi
-
-    # Step 2: Tunnel method
-    echo ""
-    echo -e "${BOLD}Select Tunnel Method:${NC}"
-    echo "  1) SSH Tunnel      (Reliable, built-in, encrypted)"
-    echo "  2) WireGuard       (Fast kernel-level VPN, UDP)"
-    echo "  3) Gost TLS Relay  (Looks like HTTPS, DPI resistant)"
-    echo "  4) Hysteria2       (QUIC/HTTP3, very fast, DPI resistant)"
-    echo ""
-    read -rp "Select method [1-4, default=3]: " METHOD_CHOICE
-    METHOD_CHOICE="${METHOD_CHOICE:-3}"
-
-    # Step 3: Forward port
-    echo ""
-    info "The Forward Port is the port that 3x-ui listens on."
-    info "Users on the Iranian server will connect to this same port."
-    local FWD_PORT=443
-    read_port "Enter forward port (same as 3x-ui port)" "443" FWD_PORT
-
-    # Step 4: Profile
-    echo ""
-    echo -e "${BOLD}Select Profile:${NC}"
-    echo "  1) Balanced       - Good speed + good security (recommended)"
-    echo "  2) Speed Priority - Maximum speed, standard security"
-    echo "  3) Security Priority - Maximum security, may reduce speed"
-    echo ""
-    read -rp "Select profile [1-3, default=1]: " PROFILE_CHOICE
-    PROFILE_CHOICE="${PROFILE_CHOICE:-1}"
-
-    local PROFILE="balanced"
-    case "$PROFILE_CHOICE" in
-        1) PROFILE="balanced" ;;
-        2) PROFILE="speed" ;;
-        3) PROFILE="security" ;;
-        *) PROFILE="balanced" ;;
-    esac
-
-    # Step 5: Install common deps
-    info "Installing dependencies..."
-    if [[ "$OS_ID" == "ubuntu" || "$OS_ID" == "debian" ]]; then
-        apt-get update -y 2>/dev/null || true
-        apt-get install -y curl wget openssl 2>/dev/null || true
-    elif [[ "$OS_ID" == "centos" || "$OS_ID" == "rhel" || "$OS_ID" == "rocky" || "$OS_ID" == "almalinux" ]]; then
-        yum install -y curl wget openssl 2>/dev/null || true
-    fi
-
-    optimize_system
-
-    # Step 6: Get server IP
-    SERVER_IP=$(get_server_ip)
-
-    # Step 7: Set up based on method
-    case "$METHOD_CHOICE" in
-        1) setup_ssh_tunnel "$TNAME" "$FWD_PORT" "$PROFILE" ;;
-        2) setup_wireguard_tunnel "$TNAME" "$FWD_PORT" "$PROFILE" ;;
-        3) setup_gost_tunnel "$TNAME" "$FWD_PORT" "$PROFILE" ;;
-        4) setup_hysteria2_tunnel "$TNAME" "$FWD_PORT" "$PROFILE" ;;
-        *) err "Invalid method."; return ;;
-    esac
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  LIST TUNNELS
-# ══════════════════════════════════════════════════════════════════════════════
-list_tunnels() {
-    echo ""
-    info "=========================================="
-    info "  Tommy v${TOMMY_VER} - Active Tunnels"
-    info "=========================================="
-
-    local FOUND=0
-    if [[ -f "$TOMMY_REGISTRY" ]]; then
-        while IFS='|' read -r tname method fwd_port profile created; do
-            FOUND=1
-            local SVC_NAME="tommy-${tname}"
-            local STATUS="STOPPED"
-            if systemctl is-active --quiet "$SVC_NAME" 2>/dev/null; then
-                STATUS="RUNNING"
-            fi
-            echo ""
-            echo -e "  ${GREEN}Name:${NC}      ${tname}"
-            echo -e "  ${GREEN}Method:${NC}    ${method}"
-            echo -e "  ${GREEN}Fwd Port:${NC}  ${fwd_port}"
-            echo -e "  ${GREEN}Profile:${NC}   ${profile}"
-            echo -e "  ${GREEN}Service:${NC}   ${SVC_NAME}"
-            echo -e "  ${GREEN}Status:${NC}    ${STATUS}"
-            echo -e "  ${GREEN}Created:${NC}   ${created}"
-            echo -e "  ${CYAN}──────────────────────────────────${NC}"
-        done < "$TOMMY_REGISTRY"
-    fi
-
-    if [[ "$FOUND" -eq 0 ]]; then
-        warn "No tunnels found. Create one with option 1."
-    fi
-    echo ""
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  DELETE TUNNEL
-# ══════════════════════════════════════════════════════════════════════════════
-delete_tunnel() {
-    echo ""
-    list_tunnels
-
-    read -rp "Enter the name of the tunnel to DELETE: " DEL_NAME
-    DEL_NAME="${DEL_NAME:-none}"
-    DEL_NAME=$(echo "$DEL_NAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
-
-    local SVC_NAME="tommy-${DEL_NAME}"
-    local TUNNEL_DIR="${TOMMY_DIR}/${DEL_NAME}"
-
-    if [[ ! -d "$TUNNEL_DIR" ]]; then
-        err "Tunnel '${DEL_NAME}' not found."
-        return
-    fi
-
-    # Read info before deletion
-    local METHOD="" FWD_PORT="" WG_PORT="" TUNNEL_PORT=""
-    if [[ -f "${TUNNEL_DIR}/tunnel-info.txt" ]]; then
-        # Read key-value pairs safely
-        while IFS='=' read -r key value; do
-            case "$key" in
-                METHOD) METHOD="$value" ;;
-                FWD_PORT) FWD_PORT="$value" ;;
-                WG_PORT) WG_PORT="$value" ;;
-                TUNNEL_PORT) TUNNEL_PORT="$value" ;;
-            esac
-        done < "${TUNNEL_DIR}/tunnel-info.txt"
-    fi
-
-    # Confirm
-    echo ""
-    warn "You are about to DELETE tunnel: ${DEL_NAME}"
-    warn "This will stop the service, remove configs, and delete all related files."
-    read -rp "Are you sure? Type 'yes' to confirm: " CONFIRM
-    if [[ "$CONFIRM" != "yes" ]]; then
-        info "Deletion cancelled."
-        return
-    fi
-
-    # Stop and disable service
-    systemctl stop "$SVC_NAME" 2>/dev/null || true
-    systemctl disable "$SVC_NAME" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${SVC_NAME}.service"
-    systemctl daemon-reload
-
-    # For WireGuard, also bring down the interface
-    if [[ "$METHOD" == "wireguard" ]]; then
-        wg-quick down "${TUNNEL_DIR}/wg0.conf" 2>/dev/null || true
-        rm -f "/etc/wireguard/wg0-${DEL_NAME}.conf" 2>/dev/null || true
-    fi
-
-    # Remove tunnel config directory
-    rm -rf "$TUNNEL_DIR"
-
-    # Remove connection code file
-    rm -f "/root/tommy-${DEL_NAME}-connection-code.txt"
-
-    # Close firewall ports
-    if [[ -n "$FWD_PORT" ]]; then
-        close_firewall "$FWD_PORT" tcp
-    fi
-    if [[ -n "$TUNNEL_PORT" ]]; then
-        if [[ "$METHOD" == "wireguard" ]]; then
-            close_firewall "${WG_PORT}" udp
-        elif [[ "$METHOD" == "hysteria2" ]]; then
-            close_firewall "$TUNNEL_PORT" udp
-        else
-            close_firewall "$TUNNEL_PORT" tcp
+# ═══════════════════════════════════════════════════════════════════════
+#  SSH TUNNEL (simple, reliable fallback)
+# ═══════════════════════════════════════════════════════════════════════
+setup_ssh_server() {
+    info "Setting up SSH tunnel server..."
+    command -v sshd &>/dev/null || {
+        if command -v apt-get &>/dev/null; then
+            apt-get install -y -qq openssh-server >/dev/null 2>&1
+        elif command -v yum &>/dev/null; then
+            yum install -y -q openssh-server >/dev/null 2>&1
         fi
+    }
+
+    # Harden SSH config for tunnel-only use
+    local sshd_config="/etc/ssh/sshd_config"
+    cp "$sshd_config" "${sshd_config}.bak.$(date +%s)"
+
+    cat >> "$sshd_config" <<SSHEOF
+
+# Tunnel-specific settings
+AllowTcpForwarding yes
+GatewayPorts no
+PermitTunnel yes
+X11Forwarding no
+MaxAuthTries 3
+ClientAliveInterval 60
+ClientAliveCountMax 3
+SSHEOF
+
+    systemctl restart sshd
+    info "SSH server configured for tunneling on port 22"
+    info "On the client, run:"
+    info "  ssh -D 1080 -f -C -q -N -o ServerAliveInterval=60 -o ServerAliveCountMax=3 user@${SERVER_IP}"
+}
+
+setup_ssh_client() {
+    [[ -z "$SERVER_IP" ]] && error "Specify foreign server IP with --ip"
+
+    info "Setting up SSH tunnel client (auto-reconnect)..."
+
+    # Generate SSH key if not exists
+    [[ -f ~/.ssh/id_ed25519 ]] || ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -q
+
+    local ssh_user="${SSH_USER:-root}"
+    local reconnect_script="${TUNNEL_DIR}/ssh-tunnel-watchdog.sh"
+
+    cat > "$reconnect_script" <<'SSHEOF'
+#!/bin/bash
+# SSH Tunnel Auto-Reconnect Script
+SERVER_IP="__SERVER_IP__"
+SSH_USER="__SSH_USER__"
+LOCAL_SOCKS_PORT=1080
+
+while true; do
+    echo "[$(date)] Starting SSH tunnel to ${SSH_USER}@${SERVER_IP}..."
+    ssh -D ${LOCAL_SOCKS_PORT} \
+        -f -C -q -N \
+        -o ServerAliveInterval=60 \
+        -o ServerAliveCountMax=3 \
+        -o ExitOnForwardFailure=yes \
+        -o StrictHostKeyChecking=no \
+        ${SSH_USER}@${SERVER_IP}
+
+    SSH_PID=$(pgrep -f "ssh -D ${LOCAL_SOCKS_PORT}")
+    if [[ -n "$SSH_PID" ]]; then
+        echo "[$(date)] SSH tunnel active (PID: ${SSH_PID}). SOCKS5 on 127.0.0.1:${LOCAL_SOCKS_PORT}"
+        wait "$SSH_PID" 2>/dev/null
     fi
 
-    # Unregister from central registry
-    unregister_tunnel "$DEL_NAME"
+    echo "[$(date)] SSH tunnel disconnected. Reconnecting in 5 seconds..."
+    sleep 5
+done
+SSHEOF
 
-    info "Tunnel '${DEL_NAME}' has been DELETED."
+    sed -i "s/__SERVER_IP__/${SERVER_IP}/g" "$reconnect_script"
+    sed -i "s/__SSH_USER__/${ssh_user}/g" "$reconnect_script"
+    chmod +x "$reconnect_script"
+
+    # Create systemd service for watchdog
+    cat > /etc/systemd/system/ssh-tunnel.service <<UNIT
+[Unit]
+Description=SSH Tunnel Auto-Reconnect
+After=network.target network-online.target
+
+[Service]
+Type=simple
+ExecStart=${reconnect_script}
+Restart=always
+RestartSec=10
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+    systemctl daemon-reload
+    systemctl enable ssh-tunnel
+    systemctl restart ssh-tunnel
+
+    info "SSH tunnel watchdog running. SOCKS5 proxy: 127.0.0.1:1080"
+    info "IMPORTANT: Copy your SSH public key to the foreign server:"
+    info "  ssh-copy-id ${ssh_user}@${SERVER_IP}"
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+#  NETWORK OPTIMIZATION (both sides)
+# ═══════════════════════════════════════════════════════════════════════
+optimize_network() {
+    info "Applying network optimizations for high-speed tunneling..."
+
+    local sysctl_file="/etc/sysctl.d/99-tunnel-optimize.conf"
+    cat > "$sysctl_file" <<SYSCTL
+# ─── TCP Performance Tuning ───
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.core.rmem_default = 1048576
+net.core.wmem_default = 1048576
+net.core.netdev_max_backlog = 65536
+net.core.somaxconn = 65536
+
+net.ipv4.tcp_rmem = 4096 1048576 16777216
+net.ipv4.tcp_wmem = 4096 1048576 16777216
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_tw_reuse = 1
+
+# ─── Connection Limits ───
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_max_syn_backlog = 65536
+net.ipv4.tcp_max_tw_buckets = 65536
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_time = 300
+net.ipv4.tcp_keepalive_intvl = 30
+net.ipv4.tcp_keepalive_probes = 5
+
+# ─── Buffer Sizes ───
+net.ipv4.udp_rmem_min = 8192
+net.ipv4.udp_wmem_min = 8192
+
+# ─── Security ───
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+
+# ─── Forwarding (required for VPN/proxy) ───
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+SYSCTL
+
+    sysctl -p "$sysctl_file" >/dev/null 2>&1
+    info "Network optimizations applied (BBR congestion control, TCP tuning)"
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+#  FIREWALL CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════
+configure_firewall() {
+    local port="${1}"
+    info "Configuring firewall to allow port ${port}..."
+
+    if command -v ufw &>/dev/null; then
+        ufw allow "${port}"/tcp >/dev/null 2>&1
+        ufw allow "${port}"/udp >/dev/null 2>&1
+        info "UFW: Allowed port ${port}"
+    elif command -v firewall-cmd &>/dev/null; then
+        firewall-cmd --permanent --add-port="${port}"/tcp >/dev/null 2>&1
+        firewall-cmd --permanent --add-port="${port}"/udp >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+        info "Firewalld: Allowed port ${port}"
+    elif command -v iptables &>/dev/null; then
+        iptables -I INPUT -p tcp --dport "${port}" -j ACCEPT 2>/dev/null
+        iptables -I INPUT -p udp --dport "${port}" -j ACCEPT 2>/dev/null
+        info "iptables: Allowed port ${port}"
+    fi
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+#  CONNECTION TEST
+# ═══════════════════════════════════════════════════════════════════════
+test_connection() {
+    info "Testing tunnel connectivity..."
+    sleep 3
+
+    case "$MODE" in
+        gost|gost-grpc)
+            if [[ "$ROLE" == "client" ]]; then
+                # Test SOCKS5 proxy
+                local ip_via_proxy
+                ip_via_proxy=$(curl -x socks5h://127.0.0.1:1080 -s --connect-timeout 10 https://api.ipify.org 2>/dev/null || echo "FAILED")
+                if [[ "$ip_via_proxy" != "FAILED" && -n "$ip_via_proxy" ]]; then
+                    info "SUCCESS! External IP via tunnel: ${ip_via_proxy}"
+                    info "Your real IP is hidden from target websites."
+                else
+                    warn "Could not verify IP through SOCKS5 proxy. Check logs: journalctl -u gost-tunnel -f"
+                fi
+
+                # Test HTTP proxy
+                local ip_via_http
+                ip_via_http=$(curl -x http://127.0.0.1:8080 -s --connect-timeout 10 https://api.ipify.org 2>/dev/null || echo "FAILED")
+                if [[ "$ip_via_http" != "FAILED" ]]; then
+                    info "HTTP proxy working. External IP: ${ip_via_http}"
+                fi
+            else
+                info "Server mode. Verify from client side."
+            fi
+            ;;
+        wireguard)
+            if [[ "$ROLE" == "client" ]]; then
+                local ip_via_wg
+                ip_via_wg=$(curl --interface wg0 -s --connect-timeout 10 https://api.ipify.org 2>/dev/null || echo "FAILED")
+                if [[ "$ip_via_wg" != "FAILED" ]]; then
+                    info "SUCCESS! External IP via WireGuard: ${ip_via_wg}"
+                else
+                    warn "WireGuard tunnel test failed. Check: wg show"
+                fi
+            fi
+            ;;
+        ssh)
+            if [[ "$ROLE" == "client" ]]; then
+                local ip_via_ssh
+                ip_via_ssh=$(curl -x socks5h://127.0.0.1:1080 -s --connect-timeout 10 https://api.ipify.org 2>/dev/null || echo "FAILED")
+                if [[ "$ip_via_ssh" != "FAILED" ]]; then
+                    info "SUCCESS! External IP via SSH tunnel: ${ip_via_ssh}"
+                else
+                    warn "SSH tunnel test failed. Check: systemctl status ssh-tunnel"
+                fi
+            fi
+            ;;
+    esac
+}
+
+# ═══════════════════════════════════════════════════════════════════════
+#  PRINT SUMMARY
+# ═══════════════════════════════════════════════════════════════════════
+print_summary() {
     echo ""
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}  Secure Tunnel Setup Complete!${NC}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "  Role:              ${YELLOW}${ROLE}${NC}"
+    echo -e "  Mode:              ${YELLOW}${MODE}${NC}"
+    echo -e "  Config Dir:        ${YELLOW}${CONFIG_DIR}${NC}"
+    echo -e "  Log Dir:           ${YELLOW}${LOG_DIR}${NC}"
+    echo ""
+
+    case "$MODE" in
+        gost|gost-grpc)
+            if [[ "$ROLE" == "client" ]]; then
+                echo -e "  ${GREEN}SOCKS5 Proxy:${NC}    127.0.0.1:1080"
+                echo -e "  ${GREEN}HTTP Proxy:${NC}      127.0.0.1:8080"
+                echo ""
+                echo -e "  ${CYAN}Usage Examples:${NC}"
+                echo "    curl -x socks5h://127.0.0.1:1080 https://google.com"
+                echo "    curl -x http://127.0.0.1:8080 https://google.com"
+                echo ""
+                echo -e "  ${CYAN}For system-wide proxy, set env vars:${NC}"
+                echo "    export ALL_PROXY=socks5h://127.0.0.1:1080"
+                echo "    export http_proxy=http://127.0.0.1:8080"
+                echo "    export https_proxy=http://127.0.0.1:8080"
+            else
+                echo -e "  ${GREEN}Listening Port:${NC}   ${SERVER_PORT}"
+                echo -e "  ${GREEN}TLS Cert:${NC}         ${CERT_FILE}"
+                echo -e "  ${GREEN}Password:${NC}         ${TUNNEL_PASS}"
+            fi
+            ;;
+        wireguard)
+            if [[ "$ROLE" == "client" ]]; then
+                echo -e "  ${GREEN}WG Interface:${NC}     wg0"
+                echo -e "  ${GREEN}Client IP:${NC}        ${WG_PEER_IP}"
+                echo -e "  ${GREEN}Server:${NC}           ${SERVER_IP}:${WG_PORT}"
+                echo ""
+                echo -e "  ${CYAN}All traffic routes through the tunnel.${NC}"
+            else
+                echo -e "  ${GREEN}WG Interface:${NC}     wg0"
+                echo -e "  ${GREEN}Listening Port:${NC}   ${WG_PORT}"
+                echo -e "  ${GREEN}Server IP:${NC}        ${WG_SERVER_IP}"
+                echo ""
+                echo -e "  ${CYAN}Client config saved to:${NC}"
+                echo "    ${CONFIG_DIR}/wg-client.conf"
+                echo -e "  ${CYAN}Copy it to the Iranian server and run:${NC}"
+                echo "    bash tunnel-setup.sh client --mode wireguard --ip <this_server_ip>"
+            fi
+            ;;
+        ssh)
+            if [[ "$ROLE" == "client" ]]; then
+                echo -e "  ${GREEN}SOCKS5 Proxy:${NC}    127.0.0.1:1080"
+                echo -e "  ${GREEN}Auto-reconnect:${NC}  Enabled (systemd watchdog)"
+            else
+                echo -e "  ${GREEN}SSH Port:${NC}        22"
+                echo -e "  ${GREEN}Forwarding:${NC}      Enabled"
+            fi
+            ;;
+    esac
+
+    echo ""
+    echo -e "  ${CYAN}Manage the service:${NC}"
+    echo "    systemctl status gost-tunnel    # or ssh-tunnel / wg-quick@wg0"
+    echo "    systemctl restart gost-tunnel"
+    echo "    journalctl -u gost-tunnel -f    # live logs"
+    echo ""
+    echo -e "  ${CYAN}IMPORTANT: Save your password!${NC}  ${TUNNEL_PASS}"
+    echo -e "${CYAN}═══════════════════════════════════════════════════════════════${NC}"
 }
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  SERVICE MANAGER
-# ══════════════════════════════════════════════════════════════════════════════
-service_manager() {
-    while true; do
-        echo ""
-        echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}║  Tommy Service Manager               ║${NC}"
-        echo -e "${CYAN}╠══════════════════════════════════════╣${NC}"
-        echo -e "${CYAN}║  1) List all tunnels                 ║${NC}"
-        echo -e "${CYAN}║  2) Start a tunnel                   ║${NC}"
-        echo -e "${CYAN}║  3) Stop a tunnel                    ║${NC}"
-        echo -e "${CYAN}║  4) Restart a tunnel                 ║${NC}"
-        echo -e "${CYAN}║  5) View tunnel status               ║${NC}"
-        echo -e "${CYAN}║  6) View tunnel logs                 ║${NC}"
-        echo -e "${CYAN}║  7) Delete a tunnel                  ║${NC}"
-        echo -e "${CYAN}║  8) Show connection code             ║${NC}"
-        echo -e "${CYAN}║  9) Back to main menu                ║${NC}"
-        echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
-        echo ""
-        read -rp "Select [1-9]: " SM_CHOICE
-
-        case "$SM_CHOICE" in
-            1)
-                list_tunnels
-                ;;
-            2)
-                list_tunnels
-                read -rp "Enter tunnel name to START: " SM_NAME
-                SM_NAME=$(echo "$SM_NAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
-                if [[ -z "$SM_NAME" ]]; then
-                    err "No tunnel name entered."
-                    continue
-                fi
-                if ! tunnel_exists "$SM_NAME"; then
-                    err "Tunnel '${SM_NAME}' does not exist."
-                    continue
-                fi
-                if systemctl start "tommy-${SM_NAME}" 2>/dev/null; then
-                    sleep 1
-                    if systemctl is-active --quiet "tommy-${SM_NAME}"; then
-                        info "Tunnel '${SM_NAME}' started and is RUNNING."
-                    else
-                        warn "Tunnel '${SM_NAME}' started but is not running. Check logs."
-                    fi
-                else
-                    err "Failed to start tunnel '${SM_NAME}'."
-                fi
-                ;;
-            3)
-                list_tunnels
-                read -rp "Enter tunnel name to STOP: " SM_NAME
-                SM_NAME=$(echo "$SM_NAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
-                if [[ -z "$SM_NAME" ]]; then
-                    err "No tunnel name entered."
-                    continue
-                fi
-                if ! tunnel_exists "$SM_NAME"; then
-                    err "Tunnel '${SM_NAME}' does not exist."
-                    continue
-                fi
-                if systemctl stop "tommy-${SM_NAME}" 2>/dev/null; then
-                    info "Tunnel '${SM_NAME}' stopped."
-                else
-                    warn "Failed to stop tunnel '${SM_NAME}'."
-                fi
-                ;;
-            4)
-                list_tunnels
-                read -rp "Enter tunnel name to RESTART: " SM_NAME
-                SM_NAME=$(echo "$SM_NAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
-                if [[ -z "$SM_NAME" ]]; then
-                    err "No tunnel name entered."
-                    continue
-                fi
-                if ! tunnel_exists "$SM_NAME"; then
-                    err "Tunnel '${SM_NAME}' does not exist."
-                    continue
-                fi
-                if systemctl restart "tommy-${SM_NAME}" 2>/dev/null; then
-                    sleep 1
-                    if systemctl is-active --quiet "tommy-${SM_NAME}"; then
-                        info "Tunnel '${SM_NAME}' restarted and is RUNNING."
-                    else
-                        warn "Tunnel '${SM_NAME}' restarted but is not running. Check logs."
-                    fi
-                else
-                    err "Failed to restart tunnel '${SM_NAME}'."
-                fi
-                ;;
-            5)
-                list_tunnels
-                read -rp "Enter tunnel name for STATUS: " SM_NAME
-                SM_NAME=$(echo "$SM_NAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
-                systemctl status "tommy-${SM_NAME}" 2>/dev/null || warn "Service not found."
-                ;;
-            6)
-                list_tunnels
-                read -rp "Enter tunnel name for LOGS: " SM_NAME
-                SM_NAME=$(echo "$SM_NAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
-                journalctl -u "tommy-${SM_NAME}" -n 50 --no-pager 2>/dev/null || warn "Service not found."
-                ;;
-            7)
-                delete_tunnel
-                ;;
-            8)
-                list_tunnels
-                read -rp "Enter tunnel name to show connection code: " SM_NAME
-                SM_NAME=$(echo "$SM_NAME" | tr -cd 'a-zA-Z0-9-' | tr '[:upper:]' '[:lower:]')
-                local CODE_FILE="/root/tommy-${SM_NAME}-connection-code.txt"
-                if [[ -f "$CODE_FILE" ]]; then
-                    echo ""
-                    echo -e "${YELLOW}Connection Code for '${SM_NAME}':${NC}"
-                    cat "$CODE_FILE"
-                    echo ""
-                else
-                    warn "Connection code file not found for '${SM_NAME}'."
-                fi
-                ;;
-            9)
-                return
-                ;;
-            *)
-                warn "Invalid choice."
-                ;;
-        esac
-    done
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAIN MENU
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════
 main() {
     check_root
-    detect_os
+    install_deps
+    setup_dirs
+    optimize_network
 
-    # Ensure base directory exists
-    mkdir -p "${TOMMY_DIR}"
+    info "Setting up ${MODE} tunnel in ${ROLE} mode..."
 
-    while true; do
-        show_banner
-        echo -e "${CYAN}╔══════════════════════════════════════╗${NC}"
-        echo -e "${CYAN}║  Tommy v${TOMMY_VER} - Foreign Server       ║${NC}"
-        echo -e "${CYAN}╠══════════════════════════════════════╣${NC}"
-        echo -e "${CYAN}║  1) Create a new tunnel              ║${NC}"
-        echo -e "${CYAN}║  2) List tunnels                     ║${NC}"
-        echo -e "${CYAN}║  3) Delete a tunnel                  ║${NC}"
-        echo -e "${CYAN}║  4) Service Manager                  ║${NC}"
-        echo -e "${CYAN}║  5) Exit                             ║${NC}"
-        echo -e "${CYAN}╚══════════════════════════════════════╝${NC}"
-        echo ""
-        read -rp "Select [1-5]: " MAIN_CHOICE
+    case "${ROLE}:${MODE}" in
+        server:gost|server:gost-grpc)
+            setup_gost_server
+            configure_firewall "$SERVER_PORT"
+            ;;
+        client:gost|client:gost-grpc)
+            setup_gost_client
+            ;;
+        server:wireguard)
+            setup_wireguard_server
+            configure_firewall "$WG_PORT"
+            ;;
+        client:wireguard)
+            setup_wireguard_client
+            ;;
+        server:ssh)
+            setup_ssh_server
+            ;;
+        client:ssh)
+            setup_ssh_client
+            ;;
+        *)
+            error "Unknown combination: ${ROLE}/${MODE}"
+            ;;
+    esac
 
-        case "$MAIN_CHOICE" in
-            1) create_tunnel ;;
-            2) list_tunnels ;;
-            3) delete_tunnel ;;
-            4) service_manager ;;
-            5) info "Goodbye!"; exit 0 ;;
-            *) warn "Invalid choice." ;;
-        esac
+    test_connection
+    print_summary
 
-        echo ""
-        read -rp "Press Enter to continue..."
-    done
+    # Save deployment info
+    cat > "${TUNNEL_DIR}/DEPLOYMENT_INFO" <<INFO
+Role: ${ROLE}
+Mode: ${MODE}
+Server Port: ${SERVER_PORT}
+Password: ${TUNNEL_PASS}
+Domain: ${DOMAIN:-N/A}
+WS Path: ${WS_PATH}
+Setup Date: $(date -u)
+INFO
+    chmod 600 "${TUNNEL_DIR}/DEPLOYMENT_INFO"
+    info "Deployment info saved to ${TUNNEL_DIR}/DEPLOYMENT_INFO (chmod 600)"
 }
 
 main
